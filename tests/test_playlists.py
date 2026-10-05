@@ -1,7 +1,14 @@
 import json
 import os
 
+import asyncio
+
+import pytest
+
+from agent.adapters import GuildPlaylists
+from agent.tools import build_registry, execute_pending
 from music import playlists as playlist_store
+from tests.agent_support import build_rig
 from tests.conftest import ORIGINAL_PLAYLISTS_DIR
 from tests.fakes import FakeContext, queued_pairs
 
@@ -200,3 +207,70 @@ async def test_playlists_are_isolated_per_guild(isolated_bot, ctx):
     await isolated_bot.pl_list.callback(other)
 
     assert other.notifier.has_text_containing("No hay playlists guardadas")
+
+
+def test_save_is_atomic_when_writing_fails_midway(isolated_bot, monkeypatch):
+    original = {"favoritas": [song("Vieja", "old")]}
+    playlist_store.save_playlists(isolated_bot.PLAYLISTS_DIR, GID, original)
+
+    def broken_dump(data, handle, **kwargs):
+        handle.write('{"favoritas": [')
+        raise OSError("disk full")
+
+    monkeypatch.setattr(playlist_store.json, "dump", broken_dump)
+
+    with pytest.raises(OSError):
+        playlist_store.save_playlists(isolated_bot.PLAYLISTS_DIR, GID, {"favoritas": []})
+
+    assert stored(isolated_bot) == original
+    assert os.listdir(isolated_bot.PLAYLISTS_DIR) == [f"{GID}.json"]
+
+
+def test_save_keeps_lf_line_endings_and_utf8(isolated_bot):
+    playlist_store.save_playlists(isolated_bot.PLAYLISTS_DIR, GID, {"ñandú": [song("Canción", "x")]})
+
+    with open(playlist_store.playlist_path(isolated_bot.PLAYLISTS_DIR, GID), "rb") as f:
+        raw = f.read()
+
+    assert b"\r\n" not in raw
+    assert "ñandú".encode("utf-8") in raw
+
+
+async def test_concurrent_agent_add_and_command_add_do_not_lose_entries(isolated_bot, ctx, tmp_path):
+    seed(isolated_bot, {"mix": []})
+    rig = build_rig(tmp_path, playlists=GuildPlaylists(isolated_bot.PLAYLISTS_DIR, GID))
+    gate = asyncio.Event()
+    searching = asyncio.Event()
+    real_search = rig.extractor.search
+
+    async def slow_search(query, count):
+        searching.set()
+        await gate.wait()
+        return await real_search(query, count)
+
+    rig.extractor.search = slow_search
+    rig.extractor.search_entries = [rig.extractor.entry("agent1", title="Del agente")]
+    isolated_bot.players.get(GID).current = {"title": "Del comando", "url": "https://www.youtube.com/watch?v=cmd1"}
+
+    agent = asyncio.create_task(build_registry().execute(rig.ctx, "playlist_add", {"name": "mix", "songs": ["x"]}))
+    await searching.wait()
+    await isolated_bot.pl_add.callback(ctx, nombre="mix")
+    gate.set()
+    await agent
+
+    assert sorted(entry["title"] for entry in stored(isolated_bot)["mix"]) == ["Del agente", "Del comando"]
+
+
+async def test_confirmed_playlist_removal_waits_for_the_guild_playlist_lock(isolated_bot, tmp_path):
+    seed(isolated_bot, {"mix": [song("Uno", "u1"), song("Dos", "u2")]})
+    rig = build_rig(tmp_path, playlists=GuildPlaylists(isolated_bot.PLAYLISTS_DIR, GID))
+    proposal = await build_registry().execute(rig.ctx, "playlist_remove", {"name": "mix", "position": 1})
+
+    async with playlist_store.guild_lock(GID):
+        execution = asyncio.create_task(execute_pending(rig.ctx, proposal.pending))
+        await asyncio.sleep(0.05)
+        assert len(stored(isolated_bot)["mix"]) == 2
+
+    await execution
+
+    assert [entry["title"] for entry in stored(isolated_bot)["mix"]] == ["Dos"]

@@ -488,11 +488,12 @@ async def pl_create(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist create <nombre>`")
     nombre = nombre.lower().strip()
-    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
-    if nombre in data:
-        return await ctx.send(f"❌ Ya existe la playlist **{nombre}**.")
-    data[nombre] = []
-    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
+    async with playlist_store.guild_lock(ctx.guild.id):
+        data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
+        if nombre in data:
+            return await ctx.send(f"❌ Ya existe la playlist **{nombre}**.")
+        data[nombre] = []
+        playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"✅ Playlist **{nombre}** creada. Agrega canciones con `!playlist add {nombre}`.")
 
 
@@ -504,14 +505,15 @@ async def pl_add(ctx, *, nombre: str = None):
     song = players.get(ctx.guild.id).current
     if not song:
         return await ctx.send("❌ No hay ninguna canción sonando ahora.")
-    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
-    if nombre not in data:
-        return await ctx.send(f"❌ No existe la playlist **{nombre}**. Créala con `!playlist create {nombre}`.")
     entry = {"title": song["title"], "url": song["url"]}
-    if entry in data[nombre]:
-        return await ctx.send(f"⚠️ **{song['title']}** ya está en **{nombre}**.")
-    data[nombre].append(entry)
-    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
+    async with playlist_store.guild_lock(ctx.guild.id):
+        data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
+        if nombre not in data:
+            return await ctx.send(f"❌ No existe la playlist **{nombre}**. Créala con `!playlist create {nombre}`.")
+        if entry in data[nombre]:
+            return await ctx.send(f"⚠️ **{song['title']}** ya está en **{nombre}**.")
+        data[nombre].append(entry)
+        playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"✅ **{song['title']}** agregada a **{nombre}** ({len(data[nombre])} canciones).")
 
 
@@ -567,14 +569,15 @@ async def pl_remove(ctx, nombre: str = None, posicion: int = None):
     if not nombre or posicion is None:
         return await ctx.send("❌ Uso: `!playlist remove <nombre> <posición>`")
     nombre = nombre.lower().strip()
-    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
-    if nombre not in data:
-        return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
-    songs = data[nombre]
-    if posicion < 1 or posicion > len(songs):
-        return await ctx.send(f"❌ Posición inválida. La playlist tiene {len(songs)} canciones.")
-    removed = songs.pop(posicion - 1)
-    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
+    async with playlist_store.guild_lock(ctx.guild.id):
+        data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
+        if nombre not in data:
+            return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
+        songs = data[nombre]
+        if posicion < 1 or posicion > len(songs):
+            return await ctx.send(f"❌ Posición inválida. La playlist tiene {len(songs)} canciones.")
+        removed = songs.pop(posicion - 1)
+        playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"🗑️ **{removed['title']}** eliminada de **{nombre}**.")
 
 
@@ -583,11 +586,12 @@ async def pl_delete(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist delete <nombre>`")
     nombre = nombre.lower().strip()
-    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
-    if nombre not in data:
-        return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
-    del data[nombre]
-    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
+    async with playlist_store.guild_lock(ctx.guild.id):
+        data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
+        if nombre not in data:
+            return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
+        del data[nombre]
+        playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"🗑️ Playlist **{nombre}** eliminada.")
 
 
