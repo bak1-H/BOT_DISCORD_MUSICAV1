@@ -1,6 +1,7 @@
 import asyncio
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 
 import discord
 
@@ -13,6 +14,7 @@ from music.ytdl import is_youtube_login_block, normalize_youtube_url
 MAX_PLAYNEXT_FAILS = 3
 ALONE_TIMEOUT = 180
 LOOP_MODES = ["off", "song", "queue"]
+MAX_QUEUE_SONGS_PER_CALL = 15
 
 
 @dataclass(frozen=True)
@@ -20,6 +22,27 @@ class EnqueueResult:
     track: Track
     preview: dict
     busy: bool
+
+
+class RemoveStatus(Enum):
+    REMOVED = "removed"
+    OUT_OF_RANGE = "out_of_range"
+    CHANGED = "changed"
+    GONE = "gone"
+
+
+@dataclass(frozen=True)
+class RemoveResult:
+    status: RemoveStatus
+    track: Track | None = None
+
+
+@dataclass
+class QueueSongsResult:
+    queued: list = field(default_factory=list)
+    not_found: list = field(default_factory=list)
+    too_long: list = field(default_factory=list)
+    skipped_over_limit: int = 0
 
 
 class MusicService:
@@ -54,19 +77,26 @@ class MusicService:
     async def extract_info(self, query: str, is_search: bool = False, search_count: int = 1) -> dict:
         return {"entries": await self.extractor.search(query, search_count)}
 
+    @staticmethod
+    def _entry_url_and_title(video: dict) -> tuple[str, str]:
+        url = normalize_youtube_url(video.get("webpage_url") or video.get("url"))
+        return url, video.get("title", "Canción")
+
+    def _is_busy(self) -> bool:
+        client = self.voice.client
+        return bool(client and (client.is_playing() or client.is_paused())) or self.player.playback_lock.locked()
+
     async def search_and_enqueue(self, query: str) -> EnqueueResult | None:
         entries = await self.extractor.search(query, 1)
         if not entries:
             return None
 
         video = entries[0]
-        url = normalize_youtube_url(video.get("webpage_url") or video.get("url"))
-        title = video.get("title", "Canción")
+        url, title = self._entry_url_and_title(video)
 
         track = self.player.enqueue(url, title)
 
-        client = self.voice.client
-        busy = bool(client and (client.is_playing() or client.is_paused())) or self.player.playback_lock.locked()
+        busy = self._is_busy()
         preview = {
             "title": title,
             "url": url,
@@ -75,6 +105,80 @@ class MusicService:
             "uploader": video.get("uploader") or video.get("channel"),
         }
         return EnqueueResult(track=track, preview=preview, busy=busy)
+
+    async def enqueue_next(self, query: str) -> EnqueueResult | None:
+        entries = await self.extractor.search(query, 1)
+        if not entries:
+            return None
+
+        video = entries[0]
+        url, title = self._entry_url_and_title(video)
+
+        busy = self._is_busy()
+        track = self.player.enqueue_front(url, title)
+        preview = {
+            "title": title,
+            "url": url,
+            "thumbnail": video.get("thumbnail"),
+            "duration": video.get("duration"),
+            "uploader": video.get("uploader") or video.get("channel"),
+        }
+        await self.ensure_playing()
+        return EnqueueResult(track=track, preview=preview, busy=busy)
+
+    async def queue_songs(self, songs: list, max_duration_s: int | None = None) -> QueueSongsResult:
+        result = QueueSongsResult()
+        accepted = songs[:MAX_QUEUE_SONGS_PER_CALL]
+        result.skipped_over_limit = len(songs) - len(accepted)
+
+        for query in accepted:
+            entries = await self.extractor.search(query, 1)
+            if not entries:
+                result.not_found.append(query)
+                continue
+            video = entries[0]
+            url, title = self._entry_url_and_title(video)
+            duration = video.get("duration")
+            if max_duration_s is not None and duration and duration > max_duration_s:
+                result.too_long.append(title)
+                continue
+            result.queued.append(self.player.enqueue(url, title))
+
+        if result.queued:
+            await self.ensure_playing()
+        return result
+
+    def remove(
+        self,
+        position: int,
+        expected_entry_id: int | None = None,
+        expected_title: str | None = None,
+    ) -> RemoveResult:
+        queue = self.player.queue
+        if not isinstance(position, int) or position < 1 or position > len(queue):
+            return RemoveResult(RemoveStatus.OUT_OF_RANGE)
+
+        track = queue[position - 1]
+        if expected_entry_id is not None and track.entry_id != expected_entry_id:
+            return RemoveResult(RemoveStatus.CHANGED, track)
+        if expected_title is not None and track.title != expected_title:
+            return RemoveResult(RemoveStatus.CHANGED, track)
+
+        del queue[position - 1]
+        return RemoveResult(RemoveStatus.REMOVED, track)
+
+    def remove_entry(self, entry_id: int) -> RemoveResult:
+        queue = self.player.queue
+        for index, track in enumerate(queue):
+            if track.entry_id == entry_id:
+                del queue[index]
+                return RemoveResult(RemoveStatus.REMOVED, track)
+        return RemoveResult(RemoveStatus.GONE)
+
+    def clear_queue(self) -> int:
+        removed = len(self.player.queue)
+        self.player.queue = []
+        return removed
 
     async def play_next(self) -> None:
         async with self.player.playback_lock:

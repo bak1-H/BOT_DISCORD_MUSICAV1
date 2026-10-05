@@ -178,6 +178,7 @@ class FakeExtractor:
     def __init__(self, download_dir):
         self.download_dir = download_dir
         self.search_entries = []
+        self.search_by_query = {}
         self.search_error = None
         self.search_calls = []
         self.download_outcomes = deque()
@@ -200,7 +201,8 @@ class FakeExtractor:
         self.search_calls.append({"query": query, "search_count": search_count})
         if self.search_error is not None:
             raise self.search_error
-        return {"entries": list(self.search_entries)[:search_count]}
+        entries = self.search_by_query.get(query, self.search_entries)
+        return {"entries": list(entries)[:search_count]}
 
     async def search(self, query, count):
         info = await self.ytdlp_extract(query, is_search=True, search_count=count)
