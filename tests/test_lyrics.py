@@ -1,3 +1,4 @@
+from music import lyrics as lyrics_module
 from tests.fakes import FakeContext
 
 GID = 1
@@ -25,8 +26,8 @@ class FakeGenius:
 
 async def test_genius_client_is_created_lazily_once(isolated_bot, monkeypatch):
     FakeGenius.instances = []
-    monkeypatch.setattr(isolated_bot, "_genius_client", None)
-    monkeypatch.setattr(isolated_bot.lyricsgenius, "Genius", FakeGenius)
+    monkeypatch.setattr(lyrics_module, "_genius_client", None)
+    monkeypatch.setattr(lyrics_module.lyricsgenius, "Genius", FakeGenius)
     monkeypatch.setenv("GENIUS_TOKEN", "token-from-env")
 
     assert FakeGenius.instances == []
@@ -41,8 +42,8 @@ async def test_genius_client_is_created_lazily_once(isolated_bot, monkeypatch):
 
 async def test_lyrics_command_uses_the_lazy_client(isolated_bot, monkeypatch):
     FakeGenius.instances = []
-    monkeypatch.setattr(isolated_bot, "_genius_client", None)
-    monkeypatch.setattr(isolated_bot.lyricsgenius, "Genius", FakeGenius)
+    monkeypatch.setattr(lyrics_module, "_genius_client", None)
+    monkeypatch.setattr(lyrics_module.lyricsgenius, "Genius", FakeGenius)
     ctx = FakeContext(guild_id=GID, connected=True)
 
     await isolated_bot.lyrics.callback(ctx, song="Tusa (Official Video)")
@@ -56,8 +57,8 @@ async def test_lyrics_command_reports_error_when_client_cannot_be_created(isolat
     def broken_genius(token, **options):
         raise TypeError("Invalid token")
 
-    monkeypatch.setattr(isolated_bot, "_genius_client", None)
-    monkeypatch.setattr(isolated_bot.lyricsgenius, "Genius", broken_genius)
+    monkeypatch.setattr(lyrics_module, "_genius_client", None)
+    monkeypatch.setattr(lyrics_module.lyricsgenius, "Genius", broken_genius)
     ctx = FakeContext(guild_id=GID, connected=True)
 
     await isolated_bot.lyrics.callback(ctx, song="Tusa")

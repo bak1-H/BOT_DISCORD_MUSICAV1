@@ -1,20 +1,19 @@
 import os
 import asyncio
-import random
 import re
-import copy
 import traceback
-import json
 from datetime import datetime, timezone, timedelta
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 import base64
-import yt_dlp
-import lyricsgenius
 import aiohttp
 import ai_dj
+from music import playlists as playlist_store, radio as radio_engine, ytdl
+from music.embeds import format_duration, make_song_embed
+from music.lyrics import clean_title_for_lyrics, get_genius
 from music.player import PlayerRegistry
+from music.ytdl import YtdlpSettings, is_youtube_login_block, normalize_youtube_url
 
 load_dotenv()
 
@@ -49,20 +48,6 @@ if not COOKIES_FILE:
         COOKIES_FILE = _bundled
         print(f"[cookies] Usando archivo bundled")
 
-# ──────────────────── GENIUS ────────────────────
-_genius_client = None
-
-
-def get_genius():
-    global _genius_client
-    if _genius_client is None:
-        _genius_client = lyricsgenius.Genius(
-            os.getenv("GENIUS_TOKEN"),
-            skip_non_songs=True,
-            remove_section_headers=True,
-        )
-    return _genius_client
-
 # ──────────────────── DISCORD ────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
@@ -76,27 +61,16 @@ RIOT_ROUTING = "americas"                          # LAS/LAN/NA usan americas
 MAX_PLAYNEXT_FAILS = 3
 PO_TOKEN = os.getenv("YOUTUBE_PO_TOKEN", "").strip()
 VISITOR_DATA = os.getenv("YOUTUBE_VISITOR_DATA", "").strip()
-# android_vr no requiere po_token y suele exponer pistas de audio puro (webm/opus)
-# en videos donde web/android/ios sólo entregan el combinado legado mp4 360p
-# (formato 18, sin variante audio-only) -> el selector "-f bestaudio" falla ahí.
-YT_CLIENTS = ["web", "android_vr", "android", "ios"]
-RADIO_MAX_DURATION_S = 600
-RADIO_BATCH_SIZE = 5
 DJ_MAX_SONGS = 15
 DJ_DEFAULT_MAX_DURATION_S = 600
 DJ_DURATION_CAP_S = 1800
 
-# ──────────────────── YT-DLP BASE CONFIG ────────────────────
-_YTDLP_BASE = {
-    "format": "bestaudio*/best*",
-    "noplaylist": True,
-    "nocheckcertificate": True,
-    "quiet": True,
-    "no_warnings": True,
-    "proxy": YTDLP_PROXY,
-    "js_runtimes": {"node": {}},
-    "cookiefile": COOKIES_FILE,
-}
+YTDLP_SETTINGS = YtdlpSettings(
+    proxy=YTDLP_PROXY,
+    cookies_file=COOKIES_FILE,
+    po_token=PO_TOKEN,
+    visitor_data=VISITOR_DATA,
+)
 
 # ──────────────────── STATE ────────────────────
 players = PlayerRegistry()
@@ -106,222 +80,18 @@ DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloa
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
-# ──────────────────── HELPERS ────────────────────
-
-def format_duration(seconds) -> str:
-    if not seconds:
-        return "?"
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-
-def clean_title_for_lyrics(title: str) -> str:
-    if not title:
-        return ""
-    title = title.lower()
-    for p in [
-        r"\(.*?\)", r"\[.*?\]", r"official video", r"official audio",
-        r"lyrics?", r"audio", r"video", r"hd", r"4k",
-        r"remastered?", r"feat\.?.*", r"ft\.?.*", r"- topic", r"•.*",
-    ]:
-        title = re.sub(p, "", title)
-    title = re.sub(r"[^\w\s\-]", "", title)
-    return re.sub(r"\s{2,}", " ", title).strip()
-
-
-def normalize_youtube_url(value: str | None) -> str | None:
-    if not value:
-        return None
-    return value if value.startswith("http") else f"https://www.youtube.com/watch?v={value}"
-
-
-def build_ytdlp_opts(is_search: bool, client: str = "web", search_count: int = 1) -> dict:
-    opts = copy.deepcopy(_YTDLP_BASE)
-    yt_args: dict = {"player_client": [client]}
-    if PO_TOKEN:
-        yt_args["po_token"] = [f"{client}+{PO_TOKEN}"]
-    if VISITOR_DATA:
-        yt_args["visitor_data"] = [VISITOR_DATA]
-    opts["extractor_args"] = {"youtube": yt_args}
-    if is_search:
-        opts["default_search"] = f"ytsearch{search_count}"
-        opts["extract_flat"] = "in_playlist"
-    return opts
-
-
-def is_youtube_login_block(err: Exception) -> bool:
-    s = str(err).lower()
-    return any(phrase in s for phrase in (
-        "sign in to confirm you're not a bot",
-        "sign in to confirm",
-        "bot check",
-        "login required",
-    ))
-
-
-def make_song_embed(song: dict, in_queue: bool = False) -> discord.Embed:
-    if in_queue:
-        embed = discord.Embed(
-            title="✅ Añadido a la cola",
-            description=f"**{song['title']}**",
-            color=discord.Color.blue(),
-        )
-    else:
-        embed = discord.Embed(
-            title="🎵 Reproduciendo ahora",
-            description=f"**{song['title']}**",
-            color=discord.Color.green(),
-        )
-    if song.get("uploader"):
-        embed.add_field(name="Canal", value=song["uploader"], inline=True)
-    if song.get("duration"):
-        embed.add_field(name="Duración", value=format_duration(song["duration"]), inline=True)
-    if song.get("thumbnail"):
-        embed.set_thumbnail(url=song["thumbnail"])
-    return embed
-
-
 # ──────────────────── AUDIO EXTRACTION ────────────────────
 
 async def ytdlp_extract(query: str, is_search: bool = False, client: str = "web", search_count: int = 1) -> dict:
-    loop = asyncio.get_running_loop()
-    opts = build_ytdlp_opts(is_search, client, search_count)
-
-    def _extract():
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(query, download=False)
-
-    return await loop.run_in_executor(None, _extract)
-
-
-def build_download_opts(gid: int, client: str) -> dict:
-    opts = build_ytdlp_opts(is_search=False, client=client)
-    opts["format"] = "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/bestaudio/best"
-    opts["outtmpl"] = os.path.join(DOWNLOAD_DIR, f"{gid}_%(id)s.%(ext)s")
-    return opts
+    return await ytdl.ytdlp_extract(YTDLP_SETTINGS, query, is_search, client, search_count)
 
 
 async def download_audio_with_fallback(gid: int, url: str) -> tuple[dict, str, str]:
-    """Try each player_client until one can extract AND download the audio.
-
-    Extraction and download happen in the same yt-dlp call (single request per
-    client) instead of extracting metadata first and re-downloading separately
-    afterwards: doing two round-trips to YouTube for the same video is what was
-    triggering an intermittent 403 on the second (download) request.
-    """
-    loop = asyncio.get_running_loop()
-    last_error = None
-    for client in YT_CLIENTS:
-        opts = build_download_opts(gid, client)
-
-        def _download():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if isinstance(info, dict) and info.get("entries"):
-                    info = info["entries"][0]
-                return info, ydl.prepare_filename(info)
-
-        try:
-            info, path = await loop.run_in_executor(None, _download)
-            if os.path.exists(path):
-                return info, path, client
-        except Exception as e:
-            last_error = e
-    if last_error:
-        raise last_error
-    raise RuntimeError("No se pudo descargar el audio con ningún client")
-
-
-# ──────────────────── RADIO ────────────────────
-
-def is_playable_candidate(entry: dict, max_duration_s: int, excluded_ids: set[str]) -> bool:
-    video_id = entry.get("id")
-    duration = entry.get("duration")
-    return (
-        bool(video_id)
-        and video_id not in excluded_ids
-        and entry.get("live_status") not in ("is_live", "is_upcoming")
-        and (duration is None or duration <= max_duration_s)
-    )
-
-
-def enqueue_entry(gid: int, entry: dict) -> str | None:
-    url = normalize_youtube_url(entry.get("webpage_url") or entry.get("url"))
-    if not url:
-        return None
-    title = entry.get("title", "Desconocido")
-    players.get(gid).enqueue(url, title)
-    return title
-
-
-def is_radio_candidate(gid: int, entry: dict) -> bool:
-    player = players.get(gid)
-    excluded_ids = player.radio.played | {player.last_video_id}
-    return is_playable_candidate(entry, RADIO_MAX_DURATION_S, excluded_ids)
-
-
-def enqueue_radio_pick(gid: int, pick: dict) -> bool:
-    title = enqueue_entry(gid, pick)
-    if title is None:
-        return False
-    radio = players.get(gid).radio
-    radio.played.add(pick["id"])
-    radio.history.append(title)
-    return True
-
-
-async def search_entries(query: str, search_count: int) -> list[dict]:
-    info = await ytdlp_extract(query, is_search=True, search_count=search_count)
-    entries = info.get("entries") if isinstance(info, dict) else None
-    return [e for e in entries or [] if isinstance(e, dict)]
-
-
-async def radio_next_from_ai(gid: int, query: str) -> bool:
-    radio = players.get(gid).radio
-    pending = radio.suggestions
-    if not pending:
-        recent_titles = list(radio.history)
-        pending.extend(await ai_dj.suggest_songs(query, recent_titles, RADIO_BATCH_SIZE))
-
-    while pending:
-        suggestion = pending.pop(0)
-        try:
-            entries = await search_entries(suggestion, search_count=3)
-        except Exception as e:
-            print(f"Radio IA error buscando '{suggestion}': {e}")
-            continue
-        pick = next((e for e in entries if is_radio_candidate(gid, e)), None)
-        if pick and enqueue_radio_pick(gid, pick):
-            return True
-    return False
-
-
-async def radio_next_from_search(gid: int, query: str) -> bool:
-    entries = await search_entries(query, search_count=5)
-    candidates = [e for e in entries if is_radio_candidate(gid, e)]
-    if not candidates:
-        players.get(gid).radio.played = set()
-        candidates = [e for e in entries if is_radio_candidate(gid, e)]
-    if not candidates:
-        return False
-    return enqueue_radio_pick(gid, random.choice(candidates))
+    return await ytdl.download_audio_with_fallback(YTDLP_SETTINGS, DOWNLOAD_DIR, gid, url)
 
 
 async def radio_next(ctx) -> bool:
-    gid = ctx.guild.id
-    query = players.get(gid).radio.query
-    if not query:
-        return False
-
-    try:
-        if await radio_next_from_ai(gid, query):
-            return True
-        return await radio_next_from_search(gid, query)
-    except Exception as e:
-        print(f"Radio error: {e}")
-        return False
+    return await radio_engine.radio_next(players.get(ctx.guild.id), ytdlp_extract)
 
 
 # ──────────────────── PLAY NEXT ────────────────────
@@ -666,14 +436,14 @@ async def dj(ctx, *, request: str = None):
         if not ctx.voice_client or not ctx.voice_client.is_connected():
             break
         try:
-            entries = await search_entries(suggestion, search_count=3)
+            entries = await radio_engine.search_entries(ytdlp_extract, suggestion, search_count=3)
         except Exception as e:
             print(f"DJ error buscando '{suggestion}': {e}")
             skipped.append(suggestion)
             continue
 
-        pick = next((e for e in entries if is_playable_candidate(e, max_duration_s, seen_ids)), None)
-        title = enqueue_entry(gid, pick) if pick else None
+        pick = next((e for e in entries if radio_engine.is_playable_candidate(e, max_duration_s, seen_ids)), None)
+        title = radio_engine.enqueue_entry(players.get(gid), pick) if pick else None
         if title is None:
             skipped.append(suggestion)
             continue
@@ -1019,23 +789,6 @@ PLAYLISTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playli
 os.makedirs(PLAYLISTS_DIR, exist_ok=True)
 
 
-def _pl_path(gid: int) -> str:
-    return os.path.join(PLAYLISTS_DIR, f"{gid}.json")
-
-
-def _load_playlists(gid: int) -> dict:
-    path = _pl_path(gid)
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_playlists(gid: int, data: dict) -> None:
-    with open(_pl_path(gid), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
 @bot.group(name="playlist", aliases=["pl"], invoke_without_command=True)
 async def playlist(ctx):
     await ctx.send(
@@ -1055,11 +808,11 @@ async def pl_create(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist create <nombre>`")
     nombre = nombre.lower().strip()
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if nombre in data:
         return await ctx.send(f"❌ Ya existe la playlist **{nombre}**.")
     data[nombre] = []
-    _save_playlists(ctx.guild.id, data)
+    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"✅ Playlist **{nombre}** creada. Agrega canciones con `!playlist add {nombre}`.")
 
 
@@ -1071,14 +824,14 @@ async def pl_add(ctx, *, nombre: str = None):
     song = players.get(ctx.guild.id).current
     if not song:
         return await ctx.send("❌ No hay ninguna canción sonando ahora.")
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if nombre not in data:
         return await ctx.send(f"❌ No existe la playlist **{nombre}**. Créala con `!playlist create {nombre}`.")
     entry = {"title": song["title"], "url": song["url"]}
     if entry in data[nombre]:
         return await ctx.send(f"⚠️ **{song['title']}** ya está en **{nombre}**.")
     data[nombre].append(entry)
-    _save_playlists(ctx.guild.id, data)
+    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"✅ **{song['title']}** agregada a **{nombre}** ({len(data[nombre])} canciones).")
 
 
@@ -1087,7 +840,7 @@ async def pl_load(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist load <nombre>`")
     nombre = nombre.lower().strip()
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if nombre not in data or not data[nombre]:
         return await ctx.send(f"❌ La playlist **{nombre}** no existe o está vacía.")
     if not await connect_to_author_voice(ctx):
@@ -1101,7 +854,7 @@ async def pl_load(ctx, *, nombre: str = None):
 
 @playlist.command(name="list")
 async def pl_list(ctx):
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if not data:
         return await ctx.send("❌ No hay playlists guardadas en este servidor.")
     embed = discord.Embed(title="📋 Playlists del servidor", color=discord.Color.blurple())
@@ -1115,7 +868,7 @@ async def pl_show(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist show <nombre>`")
     nombre = nombre.lower().strip()
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if nombre not in data:
         return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
     songs = data[nombre]
@@ -1134,14 +887,14 @@ async def pl_remove(ctx, nombre: str = None, posicion: int = None):
     if not nombre or posicion is None:
         return await ctx.send("❌ Uso: `!playlist remove <nombre> <posición>`")
     nombre = nombre.lower().strip()
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if nombre not in data:
         return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
     songs = data[nombre]
     if posicion < 1 or posicion > len(songs):
         return await ctx.send(f"❌ Posición inválida. La playlist tiene {len(songs)} canciones.")
     removed = songs.pop(posicion - 1)
-    _save_playlists(ctx.guild.id, data)
+    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"🗑️ **{removed['title']}** eliminada de **{nombre}**.")
 
 
@@ -1150,11 +903,11 @@ async def pl_delete(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist delete <nombre>`")
     nombre = nombre.lower().strip()
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if nombre not in data:
         return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
     del data[nombre]
-    _save_playlists(ctx.guild.id, data)
+    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"🗑️ Playlist **{nombre}** eliminada.")
 
 

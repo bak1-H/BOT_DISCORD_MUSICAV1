@@ -1,6 +1,7 @@
 import json
 import os
 
+from music import playlists as playlist_store
 from tests.conftest import ORIGINAL_PLAYLISTS_DIR
 from tests.fakes import FakeContext, queued_pairs
 
@@ -29,20 +30,20 @@ def test_default_playlists_directory_is_next_to_bot_module(isolated_bot):
 
 
 def test_playlist_file_is_named_after_guild_id(isolated_bot):
-    assert isolated_bot._pl_path(42) == os.path.join(isolated_bot.PLAYLISTS_DIR, "42.json")
+    assert playlist_store.playlist_path(isolated_bot.PLAYLISTS_DIR, 42) == os.path.join(isolated_bot.PLAYLISTS_DIR, "42.json")
 
 
 def test_loading_unknown_guild_returns_empty(isolated_bot):
-    assert isolated_bot._load_playlists(999) == {}
+    assert playlist_store.load_playlists(isolated_bot.PLAYLISTS_DIR, 999) == {}
 
 
 def test_save_then_load_roundtrips_unicode(isolated_bot):
     data = {"favoritas": [song("Canción ñandú", "x")]}
 
-    isolated_bot._save_playlists(GID, data)
+    playlist_store.save_playlists(isolated_bot.PLAYLISTS_DIR, GID, data)
 
-    assert isolated_bot._load_playlists(GID) == data
-    with open(isolated_bot._pl_path(GID), encoding="utf-8") as f:
+    assert playlist_store.load_playlists(isolated_bot.PLAYLISTS_DIR, GID) == data
+    with open(playlist_store.playlist_path(isolated_bot.PLAYLISTS_DIR, GID), encoding="utf-8") as f:
         assert "ñandú" in f.read()
 
 
