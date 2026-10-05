@@ -87,6 +87,22 @@ class RecordingNotifier:
         return any(fragment in title for title in self.embed_titles if title)
 
 
+class FakeVoiceGateway:
+    def __init__(self, client=None, connect_result=None):
+        self.client = client
+        self.connect_result = connect_result
+        self.connect_calls = []
+
+    async def connect(self, channel):
+        from music.ports import ConnectResult
+
+        self.connect_calls.append(channel)
+        result = self.connect_result or ConnectResult.CONNECTED
+        if result is ConnectResult.CONNECTED:
+            self.client = FakeVoiceClient(channel)
+        return result
+
+
 class FakeMember:
     def __init__(self, is_bot=False):
         self.bot = is_bot
@@ -94,7 +110,7 @@ class FakeMember:
 
 class FakeVoiceChannel:
     def __init__(self, ctx=None, members=None):
-        self.ctx = ctx
+        self.guild = ctx.guild
         self.members = members if members is not None else [FakeMember()]
         self.connect_calls = 0
         self.connect_error = None
@@ -104,7 +120,7 @@ class FakeVoiceChannel:
         if self.connect_error is not None:
             raise self.connect_error
         voice_client = FakeVoiceClient(self)
-        self.ctx.voice_client = voice_client
+        self.guild.voice_client = voice_client
         return voice_client
 
 
@@ -119,8 +135,20 @@ class FakeAuthor:
 
 
 class FakeGuild:
+    registry = {}
+
     def __init__(self, guild_id):
         self.id = guild_id
+        self.voice_client = None
+        FakeGuild.registry[guild_id] = self
+
+    @classmethod
+    def lookup(cls, guild_id):
+        return cls.registry.get(guild_id)
+
+    @classmethod
+    def forget_all(cls):
+        cls.registry = {}
 
 
 class FakeContext:
@@ -128,12 +156,19 @@ class FakeContext:
         self.guild = FakeGuild(guild_id)
         self.notifier = RecordingNotifier()
         self.channel = self.notifier
-        self.voice_client = None
         channel = FakeVoiceChannel(ctx=self)
         self.voice_channel = channel
         self.author = FakeAuthor(FakeVoiceState(channel) if in_voice else None)
         if connected:
             self.voice_client = FakeVoiceClient(channel)
+
+    @property
+    def voice_client(self):
+        return self.guild.voice_client
+
+    @voice_client.setter
+    def voice_client(self, value):
+        self.guild.voice_client = value
 
     async def send(self, content=None, **kwargs):
         await self.notifier.send(content, **kwargs)
@@ -166,6 +201,13 @@ class FakeExtractor:
         if self.search_error is not None:
             raise self.search_error
         return {"entries": list(self.search_entries)[:search_count]}
+
+    async def search(self, query, count):
+        info = await self.ytdlp_extract(query, is_search=True, search_count=count)
+        return info["entries"]
+
+    async def download(self, guild_id, url):
+        return await self.download_audio_with_fallback(guild_id, url)
 
     async def download_audio_with_fallback(self, gid, url):
         self.download_calls.append(url)
