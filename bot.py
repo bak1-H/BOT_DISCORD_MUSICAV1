@@ -693,11 +693,19 @@ async def dj(ctx, *, request: str = None):
         return
 
     gid = ctx.guild.id
-    await ctx.send(f"🎧 Armando la selección: **{request}**...")
+    await ctx.send("🤔 Pensando...")
 
     plan = await ai_dj.plan_playlist(request, DJ_MAX_SONGS, DJ_DEFAULT_MAX_DURATION_S)
     if plan is None:
         return await ctx.send("❌ No pude armar la selección con IA. Revisa que `GEMINI_API_KEY` esté configurada o usa `!play`.")
+    if not plan.is_playlist:
+        understood = f" Entendí: *{plan.summary}*." if plan.summary else ""
+        return await ctx.send(
+            f"🤷 Por ahora `!dj` solo arma selecciones de canciones.{understood}\n"
+            "Para manejar la cola usa `!queue`, `!skip` o `!stop`. No agregué nada."
+        )
+
+    await ctx.send(f"🎧 Entendí: **{(plan.summary or request).rstrip('.')}**. Buscando canciones...")
 
     max_duration_s = min(plan.max_duration_s, DJ_DURATION_CAP_S)
     added: list[str] = []

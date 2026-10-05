@@ -15,13 +15,18 @@ _SONG_LIST_SCHEMA = {
     "required": ["songs"],
 }
 
+PLAYLIST_INTENT = "playlist"
+UNSUPPORTED_INTENT = "unsupported"
+
 _PLAYLIST_PLAN_SCHEMA = {
     "type": "object",
     "properties": {
+        "intent": {"type": "string", "enum": [PLAYLIST_INTENT, UNSUPPORTED_INTENT]},
+        "summary": {"type": "string"},
         "songs": {"type": "array", "items": {"type": "string"}},
         "max_duration_s": {"type": "integer"},
     },
-    "required": ["songs", "max_duration_s"],
+    "required": ["intent", "summary", "songs", "max_duration_s"],
 }
 
 _SONG_RULES = (
@@ -34,8 +39,14 @@ _client = None
 
 @dataclass
 class PlaylistPlan:
+    intent: str
+    summary: str
     songs: list[str]
     max_duration_s: int
+
+    @property
+    def is_playlist(self) -> bool:
+        return self.intent == PLAYLIST_INTENT and bool(self.songs)
 
 
 def _get_client():
@@ -105,7 +116,14 @@ async def plan_playlist(request: str, max_songs: int, default_max_duration_s: in
     prompt = (
         "You are the DJ of a Discord music bot. A user wrote this request, usually in Spanish:\n"
         f'"{request}"\n\n'
-        "Build the list of songs that best fulfills it. "
+        f'First classify it. intent="{PLAYLIST_INTENT}" only when the user asks for music to be added '
+        "(an artist, genre, mood, era or specific songs). Anything else, such as removing, skipping, "
+        "reordering or asking about the current queue, chatting or unclear text, is "
+        f'intent="{UNSUPPORTED_INTENT}" with an empty songs list.\n'
+        "summary: one short sentence in neutral Latin American Spanish (use tú, never vos) "
+        "stating what you understood, e.g. \"10 canciones de Bad Bunny, sin videos largos\". "
+        'For unsupported requests, address the user directly, e.g. "Quieres sacar la canción 10 de la cola".\n\n'
+        "For playlist requests, build the list of songs that best fulfills it. "
         f"Use the amount of songs the user asks for, never more than {max_songs}; "
         f"if no amount is given, use {min(10, max_songs)}. {_SONG_RULES}\n"
         "Also set max_duration_s: the longest acceptable video length in seconds. "
@@ -115,10 +133,16 @@ async def plan_playlist(request: str, max_songs: int, default_max_duration_s: in
     data = await _generate_json(prompt, _PLAYLIST_PLAN_SCHEMA, PLAYLIST_TIMEOUT_S)
     if data is None:
         return None
-    songs = _clean_songs(data.get("songs"), max_songs)
-    if not songs:
-        return None
+    intent = data.get("intent")
+    if intent not in (PLAYLIST_INTENT, UNSUPPORTED_INTENT):
+        intent = UNSUPPORTED_INTENT
+    summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
     max_duration_s = data.get("max_duration_s")
     if not isinstance(max_duration_s, int) or max_duration_s <= 0:
         max_duration_s = default_max_duration_s
-    return PlaylistPlan(songs=songs, max_duration_s=max_duration_s)
+    return PlaylistPlan(
+        intent=intent,
+        summary=summary.strip(),
+        songs=_clean_songs(data.get("songs"), max_songs) if intent == PLAYLIST_INTENT else [],
+        max_duration_s=max_duration_s,
+    )
