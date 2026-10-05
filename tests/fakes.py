@@ -183,3 +183,7 @@ class FakeExtractor:
 async def settle(cycles=5):
     for _ in range(cycles):
         await asyncio.sleep(0)
+
+
+def queued_pairs(bot_module, guild_id):
+    return [(track.url, track.title) for track in bot_module.players.get(guild_id).queue]

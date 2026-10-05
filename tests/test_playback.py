@@ -3,7 +3,7 @@ import os
 
 import discord
 
-from tests.fakes import FakeContext, FakeMember, FakeVoiceChannel, settle
+from tests.fakes import FakeContext, FakeMember, FakeVoiceChannel, queued_pairs, settle
 
 GID = 1
 
@@ -11,7 +11,7 @@ GID = 1
 def queue_urls(bot_module, *video_ids):
     for video_id in video_ids:
         url = f"https://www.youtube.com/watch?v={video_id}"
-        bot_module.queues.setdefault(GID, []).append((url, f"Song {video_id}"))
+        bot_module.players.get(GID).enqueue(url, f"Song {video_id}")
 
 
 async def test_play_connects_enqueues_and_starts_playback(isolated_bot, patch_extractor, disconnected_ctx):
@@ -22,12 +22,12 @@ async def test_play_connects_enqueues_and_starts_playback(isolated_bot, patch_ex
 
     assert ctx.voice_channel.connect_calls == 1
     assert ctx.voice_client.play_calls == 1
-    assert isolated_bot.current_song[GID]["title"] == "Song abc"
-    assert isolated_bot.queues[GID] == []
+    assert isolated_bot.players.get(GID).current["title"] == "Song abc"
+    assert queued_pairs(isolated_bot, GID) == []
     assert patch_extractor.download_calls == ["https://www.youtube.com/watch?v=abc"]
     assert ctx.notifier.has_text_containing("Buscando")
     assert ctx.notifier.has_embed_titled("Reproduciendo ahora")
-    assert isolated_bot.last_text_channel[GID] is ctx.channel
+    assert isolated_bot.players.get(GID).text_channel is ctx.channel
 
 
 async def test_play_without_query_asks_for_a_song(isolated_bot, ctx):
@@ -56,12 +56,12 @@ async def test_play_while_something_is_playing_only_queues(isolated_bot, patch_e
     assert not ctx.notifier.has_embed_titled("Reproduciendo ahora")
     assert ctx.voice_client.play_calls == 0
     assert patch_extractor.download_calls == []
-    assert isolated_bot.queues[GID] == [("https://www.youtube.com/watch?v=next1", "Song next1")]
+    assert queued_pairs(isolated_bot, GID) == [("https://www.youtube.com/watch?v=next1", "Song next1")]
 
 
 async def test_play_while_playback_lock_is_held_reports_in_queue_then_starts(isolated_bot, patch_extractor, ctx):
     patch_extractor.search_entries = [patch_extractor.entry("busy1")]
-    lock = isolated_bot.get_playback_lock(GID)
+    lock = isolated_bot.players.get(GID).playback_lock
     await lock.acquire()
 
     task = asyncio.create_task(isolated_bot.play.callback(ctx, search="x"))
@@ -122,13 +122,13 @@ async def test_song_end_advances_to_next_queued_song(isolated_bot, patch_extract
     queue_urls(isolated_bot, "a", "b")
 
     await isolated_bot.ensure_playing(ctx)
-    assert isolated_bot.current_song[GID]["title"] == "Song a"
+    assert isolated_bot.players.get(GID).current["title"] == "Song a"
 
     ctx.voice_client.playing = False
     await isolated_bot.play_next(ctx)
 
-    assert isolated_bot.current_song[GID]["title"] == "Song b"
-    assert isolated_bot.queues[GID] == []
+    assert isolated_bot.players.get(GID).current["title"] == "Song b"
+    assert queued_pairs(isolated_bot, GID) == []
     assert ctx.voice_client.play_calls == 2
 
 
@@ -139,7 +139,7 @@ async def test_ensure_playing_does_nothing_when_already_playing(isolated_bot, pa
     await isolated_bot.ensure_playing(ctx)
 
     assert patch_extractor.download_calls == []
-    assert len(isolated_bot.queues[GID]) == 1
+    assert len(isolated_bot.players.get(GID).queue) == 1
 
 
 async def test_ensure_playing_does_nothing_when_paused_or_disconnected(isolated_bot, patch_extractor, ctx):
@@ -154,35 +154,35 @@ async def test_ensure_playing_does_nothing_when_paused_or_disconnected(isolated_
 
 
 async def test_loop_song_reinserts_previous_song_at_index_zero(isolated_bot, patch_extractor, ctx):
-    isolated_bot.loop_mode[GID] = "song"
-    isolated_bot.current_song[GID] = {"title": "Song prev", "url": "https://www.youtube.com/watch?v=prev"}
+    isolated_bot.players.get(GID).loop_mode = "song"
+    isolated_bot.players.get(GID).current = {"title": "Song prev", "url": "https://www.youtube.com/watch?v=prev"}
     queue_urls(isolated_bot, "other")
 
     await isolated_bot._play_next_locked(ctx)
 
     assert patch_extractor.download_calls == ["https://www.youtube.com/watch?v=prev"]
-    assert isolated_bot.current_song[GID]["title"] == "Song prev"
-    assert isolated_bot.queues[GID] == [("https://www.youtube.com/watch?v=other", "Song other")]
+    assert isolated_bot.players.get(GID).current["title"] == "Song prev"
+    assert queued_pairs(isolated_bot, GID) == [("https://www.youtube.com/watch?v=other", "Song other")]
 
 
 async def test_loop_queue_appends_previous_song_at_the_end(isolated_bot, patch_extractor, ctx):
-    isolated_bot.loop_mode[GID] = "queue"
-    isolated_bot.current_song[GID] = {"title": "Song prev", "url": "https://www.youtube.com/watch?v=prev"}
+    isolated_bot.players.get(GID).loop_mode = "queue"
+    isolated_bot.players.get(GID).current = {"title": "Song prev", "url": "https://www.youtube.com/watch?v=prev"}
     queue_urls(isolated_bot, "first")
 
     await isolated_bot._play_next_locked(ctx)
 
     assert patch_extractor.download_calls == ["https://www.youtube.com/watch?v=first"]
-    assert isolated_bot.queues[GID] == [("https://www.youtube.com/watch?v=prev", "Song prev")]
+    assert queued_pairs(isolated_bot, GID) == [("https://www.youtube.com/watch?v=prev", "Song prev")]
 
 
 async def test_loop_off_discards_previous_song(isolated_bot, patch_extractor, ctx):
-    isolated_bot.current_song[GID] = {"title": "Song prev", "url": "https://www.youtube.com/watch?v=prev"}
+    isolated_bot.players.get(GID).current = {"title": "Song prev", "url": "https://www.youtube.com/watch?v=prev"}
     queue_urls(isolated_bot, "first")
 
     await isolated_bot._play_next_locked(ctx)
 
-    assert isolated_bot.queues[GID] == []
+    assert queued_pairs(isolated_bot, GID) == []
 
 
 async def test_loop_command_cycles_off_song_queue(isolated_bot, ctx):
@@ -190,25 +190,25 @@ async def test_loop_command_cycles_off_song_queue(isolated_bot, ctx):
     await isolated_bot.loop.callback(ctx)
     await isolated_bot.loop.callback(ctx)
 
-    assert isolated_bot.loop_mode[GID] == "off"
+    assert isolated_bot.players.get(GID).loop_mode == "off"
     assert ctx.notifier.has_text_containing("canción actual")
     assert ctx.notifier.has_text_containing("cola completa")
     assert ctx.notifier.has_text_containing("desactivado")
 
 
 async def test_empty_queue_without_radio_clears_song_and_disconnects(isolated_bot, patch_extractor, ctx):
-    isolated_bot.current_song[GID] = {"title": "Song prev", "url": "u"}
+    isolated_bot.players.get(GID).current = {"title": "Song prev", "url": "u"}
 
     await isolated_bot._play_next_locked(ctx)
 
-    assert GID not in isolated_bot.current_song
+    assert isolated_bot.players.get(GID).current is None
     assert ctx.voice_client.disconnect_calls == 1
     assert patch_extractor.download_calls == []
 
 
 async def test_empty_queue_with_radio_enqueues_ai_suggestion_and_plays_it(isolated_bot, patch_extractor, ctx, monkeypatch):
-    isolated_bot.radio_query[GID] = "reggaeton viejo"
-    isolated_bot.reset_radio_state(GID)
+    isolated_bot.players.get(GID).radio.query = "reggaeton viejo"
+    isolated_bot.players.get(GID).radio.reset_pool()
     seen_requests = []
 
     async def fake_suggest_songs(seed, recent_titles, count):
@@ -222,15 +222,15 @@ async def test_empty_queue_with_radio_enqueues_ai_suggestion_and_plays_it(isolat
 
     assert seen_requests == [("reggaeton viejo", [], 5)]
     assert patch_extractor.search_calls[0]["query"] == "Daddy Yankee - Gasolina"
-    assert isolated_bot.current_song[GID]["title"] == "Song gaso"
-    assert "gaso" in isolated_bot.radio_played[GID]
-    assert list(isolated_bot.radio_history[GID]) == ["Song gaso"]
+    assert isolated_bot.players.get(GID).current["title"] == "Song gaso"
+    assert "gaso" in isolated_bot.players.get(GID).radio.played
+    assert list(isolated_bot.players.get(GID).radio.history) == ["Song gaso"]
     assert ctx.voice_client.play_calls == 1
 
 
 async def test_radio_falls_back_to_plain_search_when_ai_has_no_suggestions(isolated_bot, patch_extractor, ctx, monkeypatch):
-    isolated_bot.radio_query[GID] = "salsa"
-    isolated_bot.reset_radio_state(GID)
+    isolated_bot.players.get(GID).radio.query = "salsa"
+    isolated_bot.players.get(GID).radio.reset_pool()
 
     async def no_suggestions(seed, recent_titles, count):
         return []
@@ -241,14 +241,14 @@ async def test_radio_falls_back_to_plain_search_when_ai_has_no_suggestions(isola
     assert await isolated_bot.radio_next(ctx) is True
 
     assert patch_extractor.search_calls == [{"query": "salsa", "search_count": 5}]
-    assert isolated_bot.queues[GID] == [("https://www.youtube.com/watch?v=only", "Song only")]
+    assert queued_pairs(isolated_bot, GID) == [("https://www.youtube.com/watch?v=only", "Song only")]
 
 
 async def test_radio_skips_recently_played_and_last_video(isolated_bot, patch_extractor, ctx, monkeypatch):
-    isolated_bot.radio_query[GID] = "rock"
-    isolated_bot.reset_radio_state(GID)
-    isolated_bot.radio_played[GID].add("seen")
-    isolated_bot.last_video_id[GID] = "last"
+    isolated_bot.players.get(GID).radio.query = "rock"
+    isolated_bot.players.get(GID).radio.reset_pool()
+    isolated_bot.players.get(GID).radio.played.add("seen")
+    isolated_bot.players.get(GID).last_video_id = "last"
 
     async def no_suggestions(seed, recent_titles, count):
         return []
@@ -262,7 +262,7 @@ async def test_radio_skips_recently_played_and_last_video(isolated_bot, patch_ex
 
     assert await isolated_bot.radio_next(ctx) is True
 
-    assert isolated_bot.queues[GID] == [("https://www.youtube.com/watch?v=fresh", "Song fresh")]
+    assert queued_pairs(isolated_bot, GID) == [("https://www.youtube.com/watch?v=fresh", "Song fresh")]
 
 
 async def test_radio_next_without_active_query_returns_false(isolated_bot, ctx):
@@ -276,10 +276,10 @@ async def test_three_consecutive_failures_clear_queue_and_disconnect(isolated_bo
 
     await isolated_bot._play_next_locked(ctx)
 
-    assert isolated_bot.queues[GID] == []
+    assert queued_pairs(isolated_bot, GID) == []
     assert ctx.voice_client.disconnect_calls == 1
     assert len(patch_extractor.download_calls) == 3
-    assert isolated_bot.playnext_fail_count[GID] == 3
+    assert isolated_bot.players.get(GID).fail_count == 3
     error_messages = [t for t in ctx.notifier.texts if "Error al reproducir" in t]
     assert len(error_messages) == 1
     assert ctx.notifier.has_text_containing("Falló la reproducción varias veces")
@@ -291,8 +291,8 @@ async def test_a_success_after_failures_resets_the_failure_counter(isolated_bot,
 
     await isolated_bot._play_next_locked(ctx)
 
-    assert isolated_bot.playnext_fail_count[GID] == 0
-    assert isolated_bot.current_song[GID]["title"] == "Song b"
+    assert isolated_bot.players.get(GID).fail_count == 0
+    assert isolated_bot.players.get(GID).current["title"] == "Song b"
     assert ctx.voice_client.disconnect_calls == 0
 
 
@@ -304,8 +304,8 @@ async def test_login_block_skips_song_without_counting_failure(isolated_bot, pat
 
     assert ctx.notifier.has_text_containing("Song blocked")
     assert ctx.notifier.has_text_containing("bloqueado por YouTube")
-    assert isolated_bot.playnext_fail_count[GID] == 0
-    assert isolated_bot.current_song[GID]["title"] == "Song good"
+    assert isolated_bot.players.get(GID).fail_count == 0
+    assert isolated_bot.players.get(GID).current["title"] == "Song good"
     assert ctx.voice_client.disconnect_calls == 0
 
 
@@ -319,9 +319,9 @@ async def test_already_playing_error_aborts_without_counting_or_retrying(isolate
 
     await isolated_bot._play_next_locked(ctx)
 
-    assert isolated_bot.playnext_fail_count[GID] == 0
+    assert isolated_bot.players.get(GID).fail_count == 0
     assert patch_extractor.download_calls == ["https://www.youtube.com/watch?v=a"]
-    assert isolated_bot.queues[GID] == [("https://www.youtube.com/watch?v=b", "Song b")]
+    assert queued_pairs(isolated_bot, GID) == [("https://www.youtube.com/watch?v=b", "Song b")]
     assert not ctx.notifier.has_text_containing("Error al reproducir")
 
 
@@ -332,21 +332,21 @@ async def test_playback_aborts_and_cleans_file_when_voice_disconnected_during_do
     await isolated_bot._play_next_locked(ctx)
 
     assert ctx.voice_client.play_calls == 0
-    assert GID not in isolated_bot.current_audio_file
+    assert isolated_bot.players.get(GID).audio_file is None
     assert os.listdir(isolated_bot.DOWNLOAD_DIR) == []
 
 
 async def test_previous_audio_file_is_removed_when_advancing(isolated_bot, patch_extractor, ctx):
     queue_urls(isolated_bot, "a", "b")
     await isolated_bot.ensure_playing(ctx)
-    first_file = isolated_bot.current_audio_file[GID]
+    first_file = isolated_bot.players.get(GID).audio_file
     assert os.path.exists(first_file)
 
     ctx.voice_client.playing = False
     await isolated_bot.play_next(ctx)
 
     assert not os.path.exists(first_file)
-    assert isolated_bot.current_audio_file[GID] != first_file
+    assert isolated_bot.players.get(GID).audio_file != first_file
 
 
 async def test_skip_stops_current_song(isolated_bot, ctx):
@@ -369,22 +369,22 @@ async def test_stop_clears_all_guild_state_and_disconnects(isolated_bot, patch_e
     audio_file = tmp_path / "current.webm"
     audio_file.write_bytes(b"audio")
     queue_urls(isolated_bot, "a", "b")
-    isolated_bot.current_song[GID] = {"title": "Song x", "url": "u"}
-    isolated_bot.loop_mode[GID] = "song"
-    isolated_bot.radio_query[GID] = "pop"
-    isolated_bot.reset_radio_state(GID)
-    isolated_bot.current_audio_file[GID] = str(audio_file)
+    isolated_bot.players.get(GID).current = {"title": "Song x", "url": "u"}
+    isolated_bot.players.get(GID).loop_mode = "song"
+    isolated_bot.players.get(GID).radio.query = "pop"
+    isolated_bot.players.get(GID).radio.reset_pool()
+    isolated_bot.players.get(GID).audio_file = str(audio_file)
     ctx.voice_client.playing = True
 
     await isolated_bot.stop.callback(ctx)
 
-    assert isolated_bot.queues[GID] == []
-    assert GID not in isolated_bot.current_song
-    assert GID not in isolated_bot.loop_mode
-    assert GID not in isolated_bot.radio_query
-    assert GID not in isolated_bot.radio_played
-    assert GID not in isolated_bot.radio_history
-    assert GID not in isolated_bot.radio_suggestions
+    assert queued_pairs(isolated_bot, GID) == []
+    assert isolated_bot.players.get(GID).current is None
+    assert isolated_bot.players.get(GID).loop_mode == "off"
+    assert isolated_bot.players.get(GID).radio.query is None
+    assert isolated_bot.players.get(GID).radio.played == set()
+    assert list(isolated_bot.players.get(GID).radio.history) == []
+    assert isolated_bot.players.get(GID).radio.suggestions == []
     assert not audio_file.exists()
     assert ctx.voice_client.stop_calls == 1
     assert ctx.voice_client.disconnect_calls == 1
@@ -404,9 +404,9 @@ async def test_pause_and_resume_toggle_playback(isolated_bot, ctx):
 
 
 async def test_queue_command_lists_current_song_and_first_ten_entries(isolated_bot, ctx):
-    isolated_bot.current_song[GID] = {"title": "Now", "url": "u", "duration": 65}
+    isolated_bot.players.get(GID).current = {"title": "Now", "url": "u", "duration": 65}
     queue_urls(isolated_bot, *[f"q{i}" for i in range(12)])
-    isolated_bot.radio_query[GID] = "jazz"
+    isolated_bot.players.get(GID).radio.query = "jazz"
 
     await isolated_bot.queue.callback(ctx)
 
@@ -431,17 +431,17 @@ async def test_alone_timeout_clears_state_and_disconnects(isolated_bot, patch_ex
     voice_client = ctx.voice_client
     voice_client.channel = FakeVoiceChannel(ctx=ctx, members=[FakeMember(is_bot=True)])
     queue_urls(isolated_bot, "a")
-    isolated_bot.current_song[GID] = {"title": "Song x", "url": "u"}
-    isolated_bot.loop_mode[GID] = "queue"
-    isolated_bot.radio_query[GID] = "pop"
-    isolated_bot.last_text_channel[GID] = ctx.channel
+    isolated_bot.players.get(GID).current = {"title": "Song x", "url": "u"}
+    isolated_bot.players.get(GID).loop_mode = "queue"
+    isolated_bot.players.get(GID).radio.query = "pop"
+    isolated_bot.players.get(GID).text_channel = ctx.channel
 
     await isolated_bot._alone_timeout(voice_client, GID)
 
-    assert GID not in isolated_bot.queues
-    assert GID not in isolated_bot.current_song
-    assert GID not in isolated_bot.loop_mode
-    assert GID not in isolated_bot.radio_query
+    assert queued_pairs(isolated_bot, GID) == []
+    assert isolated_bot.players.get(GID).current is None
+    assert isolated_bot.players.get(GID).loop_mode == "off"
+    assert isolated_bot.players.get(GID).radio.query is None
     assert voice_client.disconnect_calls == 1
     assert ctx.notifier.has_text_containing("quedé solo en el canal")
 
@@ -455,7 +455,7 @@ async def test_alone_timeout_does_nothing_when_a_human_is_present(isolated_bot, 
     await isolated_bot._alone_timeout(voice_client, GID)
 
     assert voice_client.disconnect_calls == 0
-    assert len(isolated_bot.queues[GID]) == 1
+    assert len(isolated_bot.players.get(GID).queue) == 1
 
 
 async def test_guilds_do_not_share_queues(isolated_bot, patch_extractor):
@@ -467,8 +467,8 @@ async def test_guilds_do_not_share_queues(isolated_bot, patch_extractor):
 
     await isolated_bot.play.callback(first, search="x")
 
-    assert len(isolated_bot.queues[1]) == 1
-    assert isolated_bot.queues.get(2, []) == []
+    assert len(isolated_bot.players.get(1).queue) == 1
+    assert queued_pairs(isolated_bot, 2) == []
 
 
 async def test_connect_timeout_reports_error_and_aborts(isolated_bot, patch_extractor, disconnected_ctx):

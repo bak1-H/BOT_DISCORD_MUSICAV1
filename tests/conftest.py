@@ -15,36 +15,17 @@ for _name, _value in {
 import pytest
 
 import bot as bot_module
+from music.player import PlayerRegistry
 from tests.fakes import FakeAudioSource, FakeContext, FakeExtractor
 
 ORIGINAL_DOWNLOAD_DIR = bot_module.DOWNLOAD_DIR
 ORIGINAL_PLAYLISTS_DIR = bot_module.PLAYLISTS_DIR
 
-PER_GUILD_STATE = (
-    "queues",
-    "current_song",
-    "radio_query",
-    "radio_played",
-    "radio_history",
-    "radio_suggestions",
-    "last_video_id",
-    "playnext_fail_count",
-    "voice_state_locks",
-    "current_audio_file",
-    "loop_mode",
-    "alone_tasks",
-    "last_text_channel",
-    "playback_locks",
-)
-
-
 def reset_per_guild_state():
-    for name in PER_GUILD_STATE:
-        state = getattr(bot_module, name)
-        if name == "alone_tasks":
-            for task in state.values():
-                task.cancel()
-        state.clear()
+    for player in bot_module.players.all():
+        if player.alone_task is not None:
+            player.alone_task.cancel()
+    bot_module.players = PlayerRegistry()
 
 
 @pytest.fixture(autouse=True)

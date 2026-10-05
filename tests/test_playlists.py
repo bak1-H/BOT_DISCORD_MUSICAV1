@@ -2,7 +2,7 @@ import json
 import os
 
 from tests.conftest import ORIGINAL_PLAYLISTS_DIR
-from tests.fakes import FakeContext
+from tests.fakes import FakeContext, queued_pairs
 
 GID = 1
 
@@ -69,7 +69,7 @@ async def test_create_without_name_shows_usage(isolated_bot, ctx):
 
 async def test_add_stores_current_song_once(isolated_bot, ctx):
     seed(isolated_bot, {"favoritas": []})
-    isolated_bot.current_song[GID] = {"title": "Tusa", "url": "https://www.youtube.com/watch?v=tusa"}
+    isolated_bot.players.get(GID).current = {"title": "Tusa", "url": "https://www.youtube.com/watch?v=tusa"}
 
     await isolated_bot.pl_add.callback(ctx, nombre="favoritas")
     await isolated_bot.pl_add.callback(ctx, nombre="favoritas")
@@ -89,7 +89,7 @@ async def test_add_without_current_song_is_rejected(isolated_bot, ctx):
 
 
 async def test_add_to_unknown_playlist_is_rejected(isolated_bot, ctx):
-    isolated_bot.current_song[GID] = {"title": "Tusa", "url": "u"}
+    isolated_bot.players.get(GID).current = {"title": "Tusa", "url": "u"}
 
     await isolated_bot.pl_add.callback(ctx, nombre="nada")
 
@@ -103,7 +103,7 @@ async def test_load_enqueues_every_song_and_starts_playback(isolated_bot, patch_
 
     assert disconnected_ctx.voice_client.play_calls == 1
     assert patch_extractor.download_calls == ["https://www.youtube.com/watch?v=uno"]
-    assert isolated_bot.queues[GID] == [("https://www.youtube.com/watch?v=dos", "Dos")]
+    assert queued_pairs(isolated_bot, GID) == [("https://www.youtube.com/watch?v=dos", "Dos")]
     assert disconnected_ctx.notifier.has_text_containing("2 canciones añadidas a la cola")
 
 
@@ -124,7 +124,7 @@ async def test_load_requires_author_in_voice(isolated_bot, patch_extractor):
     await isolated_bot.pl_load.callback(ctx, nombre="favoritas")
 
     assert ctx.notifier.has_text_containing("Debes estar en un canal de voz")
-    assert isolated_bot.queues.get(GID, []) == []
+    assert queued_pairs(isolated_bot, GID) == []
 
 
 async def test_list_shows_playlists_with_song_counts(isolated_bot, ctx):

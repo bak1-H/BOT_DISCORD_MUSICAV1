@@ -14,8 +14,10 @@ ISOLATED_ENV = {
 }
 
 
-def run_python(code):
+def run_python(code, without=()):
     env = {**os.environ, **ISOLATED_ENV}
+    for name in without:
+        env.pop(name, None)
     return subprocess.run(
         [sys.executable, "-c", textwrap.dedent(code)],
         cwd=REPO_ROOT,
@@ -73,3 +75,18 @@ def test_data_directories_default_next_to_bot_module():
 
     assert ORIGINAL_DOWNLOAD_DIR == os.path.join(REPO_ROOT, "downloads")
     assert ORIGINAL_PLAYLISTS_DIR == os.path.join(REPO_ROOT, "playlists")
+
+
+def test_import_succeeds_without_genius_token():
+    result = run_python(
+        """
+        import dotenv
+
+        dotenv.load_dotenv = lambda *args, **kwargs: False
+        import bot
+        print("imported", bot.bot.command_prefix)
+        """,
+        without=("GENIUS_TOKEN", "GENIUS_ACCESS_TOKEN"),
+    )
+    assert result.returncode == 0, result.stderr
+    assert "imported !" in result.stdout
