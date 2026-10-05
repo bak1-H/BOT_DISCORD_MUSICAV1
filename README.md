@@ -22,6 +22,7 @@ Bot de música para Discord escrito en Python. Reproduce audio de YouTube en can
 | `!queue` / `!q` | Muestra la cola y la canción actual |
 | `!np` / `!nowplaying` | Muestra la canción que se está reproduciendo |
 | `!lyrics [canción]` | Muestra la letra. Sin argumento usa la canción actual |
+| `!dj <pedido>` | Arma una selección con IA a partir de un pedido libre (requiere `GEMINI_API_KEY`) |
 | `!radio <estilo>` | Activa la radio: busca y reproduce canciones del género en bucle |
 | `!radio off` | Desactiva la radio |
 | `!clear <n>` | Elimina los últimos n mensajes (requiere permiso Manage Messages) |
@@ -46,6 +47,8 @@ Variables opcionales:
 | `YTDLP_PROXY` | Proxy para yt-dlp (formato `http://host:puerto`) |
 | `YOUTUBE_PO_TOKEN` | PO Token de YouTube para evitar bot-check |
 | `YOUTUBE_VISITOR_DATA` | Visitor Data de YouTube (complementa el PO Token) |
+| `GEMINI_API_KEY` | Activa las funciones con IA: `!dj` y la radio inteligente. Sin ella, `!dj` no está disponible y la radio busca como antes |
+| `GEMINI_MODEL` | Modelo de Gemini para las funciones con IA (por defecto `gemini-3.5-flash-lite`) |
 | `PORT` | Puerto del health check HTTP (por defecto `8080`) |
 
 ## Instalación local

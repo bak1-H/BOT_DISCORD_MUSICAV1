@@ -6,6 +6,7 @@ import copy
 import traceback
 import json
 from datetime import datetime, timezone, timedelta
+from collections import deque
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -13,6 +14,7 @@ import base64
 import yt_dlp
 import lyricsgenius
 import aiohttp
+import ai_dj
 
 load_dotenv()
 
@@ -71,6 +73,12 @@ VISITOR_DATA = os.getenv("YOUTUBE_VISITOR_DATA", "").strip()
 # en videos donde web/android/ios sólo entregan el combinado legado mp4 360p
 # (formato 18, sin variante audio-only) -> el selector "-f bestaudio" falla ahí.
 YT_CLIENTS = ["web", "android_vr", "android", "ios"]
+RADIO_MAX_DURATION_S = 600
+RADIO_HISTORY_SIZE = 10
+RADIO_BATCH_SIZE = 5
+DJ_MAX_SONGS = 15
+DJ_DEFAULT_MAX_DURATION_S = 600
+DJ_DURATION_CAP_S = 1800
 
 # ──────────────────── YT-DLP BASE CONFIG ────────────────────
 _YTDLP_BASE = {
@@ -91,6 +99,8 @@ queues: dict[int, list[tuple[str, str]]] = {}
 current_song: dict[int, dict] = {}
 radio_query: dict[int, str | None] = {}       # contexto activo por servidor
 radio_played: dict[int, set[str]] = {}         # IDs reproducidos para no repetir
+radio_history: dict[int, deque[str]] = {}
+radio_suggestions: dict[int, list[str]] = {}
 last_video_id: dict[int, str] = {}
 playnext_fail_count: dict[int, int] = {}
 voice_state_locks: dict[int, asyncio.Lock] = {}
@@ -264,43 +274,99 @@ async def download_audio_with_fallback(gid: int, url: str) -> tuple[dict, str, s
 
 # ──────────────────── RADIO ────────────────────
 
+def reset_radio_state(gid: int) -> None:
+    radio_played[gid] = set()
+    radio_history[gid] = deque(maxlen=RADIO_HISTORY_SIZE)
+    radio_suggestions[gid] = []
+
+
+def clear_radio_state(gid: int) -> None:
+    radio_query.pop(gid, None)
+    radio_played.pop(gid, None)
+    radio_history.pop(gid, None)
+    radio_suggestions.pop(gid, None)
+
+
+def is_playable_candidate(entry: dict, max_duration_s: int, excluded_ids: set[str]) -> bool:
+    video_id = entry.get("id")
+    duration = entry.get("duration")
+    return (
+        bool(video_id)
+        and video_id not in excluded_ids
+        and entry.get("live_status") not in ("is_live", "is_upcoming")
+        and (duration is None or duration <= max_duration_s)
+    )
+
+
+def enqueue_entry(gid: int, entry: dict) -> str | None:
+    url = normalize_youtube_url(entry.get("webpage_url") or entry.get("url"))
+    if not url:
+        return None
+    title = entry.get("title", "Desconocido")
+    queues.setdefault(gid, []).append((url, title))
+    return title
+
+
+def is_radio_candidate(gid: int, entry: dict) -> bool:
+    excluded_ids = radio_played.get(gid, set()) | {last_video_id.get(gid)}
+    return is_playable_candidate(entry, RADIO_MAX_DURATION_S, excluded_ids)
+
+
+def enqueue_radio_pick(gid: int, pick: dict) -> bool:
+    title = enqueue_entry(gid, pick)
+    if title is None:
+        return False
+    radio_played.setdefault(gid, set()).add(pick["id"])
+    radio_history.setdefault(gid, deque(maxlen=RADIO_HISTORY_SIZE)).append(title)
+    return True
+
+
+async def search_entries(query: str, search_count: int) -> list[dict]:
+    info = await ytdlp_extract(query, is_search=True, search_count=search_count)
+    entries = info.get("entries") if isinstance(info, dict) else None
+    return [e for e in entries or [] if isinstance(e, dict)]
+
+
+async def radio_next_from_ai(gid: int, query: str) -> bool:
+    pending = radio_suggestions.setdefault(gid, [])
+    if not pending:
+        recent_titles = list(radio_history.get(gid, []))
+        pending.extend(await ai_dj.suggest_songs(query, recent_titles, RADIO_BATCH_SIZE))
+
+    while pending:
+        suggestion = pending.pop(0)
+        try:
+            entries = await search_entries(suggestion, search_count=3)
+        except Exception as e:
+            print(f"Radio IA error buscando '{suggestion}': {e}")
+            continue
+        pick = next((e for e in entries if is_radio_candidate(gid, e)), None)
+        if pick and enqueue_radio_pick(gid, pick):
+            return True
+    return False
+
+
+async def radio_next_from_search(gid: int, query: str) -> bool:
+    entries = await search_entries(query, search_count=5)
+    candidates = [e for e in entries if is_radio_candidate(gid, e)]
+    if not candidates:
+        radio_played[gid] = set()
+        candidates = [e for e in entries if is_radio_candidate(gid, e)]
+    if not candidates:
+        return False
+    return enqueue_radio_pick(gid, random.choice(candidates))
+
+
 async def radio_next(ctx) -> bool:
     gid = ctx.guild.id
     query = radio_query.get(gid)
     if not query:
         return False
 
-    played = radio_played.setdefault(gid, set())
-    last_id = last_video_id.get(gid)
-
     try:
-        info = await ytdlp_extract(query, is_search=True, search_count=5)
-        entries = info.get("entries") if isinstance(info, dict) else None
-        if not entries:
-            return False
-
-        candidates = [
-            e for e in entries
-            if e.get("id") and e.get("id") != last_id and e.get("id") not in played
-        ]
-        if not candidates:
-            # Si ya se jugaron todos, resetear historial y volver a intentar
-            radio_played[gid] = set()
-            candidates = [e for e in entries if e.get("id") != last_id]
-        if not candidates:
-            return False
-
-        pick = random.choice(candidates)
-        url = normalize_youtube_url(pick.get("webpage_url") or pick.get("url"))
-        title = pick.get("title", "Desconocido")
-        if not url:
-            return False
-
-        if pick.get("id"):
-            radio_played[gid].add(pick["id"])
-
-        queues.setdefault(gid, []).append((url, title))
-        return True
+        if await radio_next_from_ai(gid, query):
+            return True
+        return await radio_next_from_search(gid, query)
     except Exception as e:
         print(f"Radio error: {e}")
         return False
@@ -412,32 +478,41 @@ async def _play_next_locked(ctx):
 
 # ──────────────────── COMANDOS ────────────────────
 
-@bot.command()
-async def play(ctx, *, search: str = None):
-    if not search:
-        return await ctx.send("❌ Escribe el nombre de una canción.")
+async def send_quietly(ctx, message: str) -> None:
+    try:
+        await ctx.send(message)
+    except Exception:
+        pass
+
+
+async def connect_to_author_voice(ctx) -> bool:
     if not ctx.author.voice:
-        return await ctx.send("❌ Debes estar en un canal de voz.")
+        await ctx.send("❌ Debes estar en un canal de voz.")
+        return False
 
     async with get_voice_lock(ctx.guild.id):
         if not ctx.voice_client or not ctx.voice_client.is_connected():
             try:
                 await ctx.author.voice.channel.connect(timeout=60)
             except asyncio.TimeoutError:
-                try:
-                    await ctx.send("❌ No pude conectarme al canal de voz (timeout). Verifica que el bot tenga permisos y que no haya un firewall bloqueando UDP.")
-                except Exception:
-                    pass
-                return
+                await send_quietly(ctx, "❌ No pude conectarme al canal de voz (timeout). Verifica que el bot tenga permisos y que no haya un firewall bloqueando UDP.")
+                return False
             except (discord.Forbidden, discord.HTTPException, discord.ClientException) as e:
                 print(f"Voice connect error: {e}")
-                try:
-                    await ctx.send("❌ No pude conectarme al canal de voz (permisos/capacidad).")
-                except Exception:
-                    pass
-                return
+                await send_quietly(ctx, "❌ No pude conectarme al canal de voz (permisos/capacidad).")
+                return False
 
     last_text_channel[ctx.guild.id] = ctx.channel
+    return True
+
+
+@bot.command()
+async def play(ctx, *, search: str = None):
+    if not search:
+        return await ctx.send("❌ Escribe el nombre de una canción.")
+    if not await connect_to_author_voice(ctx):
+        return
+
     await ctx.send(f"🔍 Buscando: **{search}**...")
 
     try:
@@ -493,8 +568,7 @@ async def stop(ctx):
     queues[gid] = []
     current_song.pop(gid, None)
     loop_mode.pop(gid, None)
-    radio_query.pop(gid, None)
-    radio_played.pop(gid, None)
+    clear_radio_state(gid)
     async with get_voice_lock(gid):
         if ctx.voice_client:
             ctx.voice_client.stop()
@@ -587,35 +661,15 @@ async def radio(ctx, *, query: str = None):
     gid = ctx.guild.id
 
     if not query or query.lower() == "off":
-        radio_query.pop(gid, None)
-        radio_played.pop(gid, None)
+        clear_radio_state(gid)
         await ctx.send("📻 Radio desactivada.")
         return
 
-    if not ctx.author.voice:
-        return await ctx.send("❌ Debes estar en un canal de voz.")
+    if not await connect_to_author_voice(ctx):
+        return
 
-    async with get_voice_lock(gid):
-        if not ctx.voice_client or not ctx.voice_client.is_connected():
-            try:
-                await ctx.author.voice.channel.connect(timeout=60)
-            except asyncio.TimeoutError:
-                try:
-                    await ctx.send("❌ No pude conectarme al canal de voz (timeout).")
-                except Exception:
-                    pass
-                return
-            except (discord.Forbidden, discord.HTTPException, discord.ClientException) as e:
-                print(f"Voice connect error: {e}")
-                try:
-                    await ctx.send("❌ No pude conectarme al canal de voz.")
-                except Exception:
-                    pass
-                return
-
-    last_text_channel[gid] = ctx.channel
     radio_query[gid] = query
-    radio_played[gid] = set()
+    reset_radio_state(gid)
 
     embed = discord.Embed(
         title="📻 Radio activada",
@@ -632,6 +686,61 @@ async def radio(ctx, *, query: str = None):
 
 
 @bot.command()
+async def dj(ctx, *, request: str = None):
+    if not request:
+        return await ctx.send("❌ Dime qué quieres escuchar. Ej: `!dj 10 de Bad Bunny sin videos de 1 hora`")
+    if not await connect_to_author_voice(ctx):
+        return
+
+    gid = ctx.guild.id
+    await ctx.send(f"🎧 Armando la selección: **{request}**...")
+
+    plan = await ai_dj.plan_playlist(request, DJ_MAX_SONGS, DJ_DEFAULT_MAX_DURATION_S)
+    if plan is None:
+        return await ctx.send("❌ No pude armar la selección con IA. Revisa que `GEMINI_API_KEY` esté configurada o usa `!play`.")
+
+    max_duration_s = min(plan.max_duration_s, DJ_DURATION_CAP_S)
+    added: list[str] = []
+    skipped: list[str] = []
+    seen_ids: set[str] = set()
+
+    for suggestion in plan.songs:
+        if not ctx.voice_client or not ctx.voice_client.is_connected():
+            break
+        try:
+            entries = await search_entries(suggestion, search_count=3)
+        except Exception as e:
+            print(f"DJ error buscando '{suggestion}': {e}")
+            skipped.append(suggestion)
+            continue
+
+        pick = next((e for e in entries if is_playable_candidate(e, max_duration_s, seen_ids)), None)
+        title = enqueue_entry(gid, pick) if pick else None
+        if title is None:
+            skipped.append(suggestion)
+            continue
+
+        seen_ids.add(pick["id"])
+        added.append(title)
+        if len(added) == 1:
+            await ensure_playing(ctx)
+
+    if not added:
+        return await ctx.send("❌ No encontré canciones que cumplan con el pedido.")
+
+    embed = discord.Embed(
+        title="🎧 Selección del DJ",
+        description="\n".join(f"`{i}.` {title}" for i, title in enumerate(added, start=1)),
+        color=discord.Color.og_blurple(),
+    )
+    footer = f"Duración máxima: {format_duration(max_duration_s)}"
+    if skipped:
+        footer += f" · {len(skipped)} sugerencias descartadas (no encontradas o muy largas)"
+    embed.set_footer(text=footer)
+    await ctx.send(embed=embed)
+
+
+@bot.command()
 async def comandos(ctx):
     embed = discord.Embed(title="🎵 Comandos del Bot de Música", color=discord.Color.blurple())
     embed.add_field(name="!play <canción o URL>", value="Reproduce o añade a la cola.", inline=False)
@@ -642,6 +751,7 @@ async def comandos(ctx):
     embed.add_field(name="!np / !nowplaying", value="Muestra la canción actual.", inline=False)
     embed.add_field(name="!lyrics [canción]", value="Muestra la letra de la canción.", inline=False)
     embed.add_field(name="!loop", value="Cicla entre: sin loop → repetir canción → repetir cola.", inline=False)
+    embed.add_field(name="!dj <pedido>", value="Arma una selección con IA. Ej: `!dj 10 de Bad Bunny sin videos de 1 hora`.", inline=False)
     embed.add_field(name="!radio <estilo>", value="Reproduce canciones del estilo en bucle. `!radio off` para detener.", inline=False)
     embed.add_field(name="!clear <n>", value="Elimina los últimos n mensajes (requiere permisos).", inline=False)
     embed.add_field(name="!invocador <Nombre#TAG>", value="Muestra el rango y stats de un invocador de LoL.", inline=False)
@@ -1022,15 +1132,8 @@ async def pl_load(ctx, *, nombre: str = None):
     data = _load_playlists(ctx.guild.id)
     if nombre not in data or not data[nombre]:
         return await ctx.send(f"❌ La playlist **{nombre}** no existe o está vacía.")
-    if not ctx.author.voice:
-        return await ctx.send("❌ Debes estar en un canal de voz.")
-    async with get_voice_lock(ctx.guild.id):
-        if not ctx.voice_client or not ctx.voice_client.is_connected():
-            try:
-                await ctx.author.voice.channel.connect(timeout=60)
-            except Exception as e:
-                return await ctx.send(f"❌ No pude conectarme al canal de voz: {e}")
-    last_text_channel[ctx.guild.id] = ctx.channel
+    if not await connect_to_author_voice(ctx):
+        return
     songs = data[nombre]
     for entry in songs:
         queues.setdefault(ctx.guild.id, []).append((entry["url"], entry["title"]))
@@ -1124,8 +1227,7 @@ async def _alone_timeout(vc: discord.VoiceClient, gid: int) -> None:
     queues.pop(gid, None)
     current_song.pop(gid, None)
     loop_mode.pop(gid, None)
-    radio_query.pop(gid, None)
-    radio_played.pop(gid, None)
+    clear_radio_state(gid)
     alone_tasks.pop(gid, None)
     async with get_voice_lock(gid):
         if vc.is_connected():

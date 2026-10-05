@@ -4,3 +4,4 @@ python-dotenv
 lyricsgenius
 yt-dlp[default]
 davey
+google-genai
