@@ -3,6 +3,7 @@ import os
 from collections import deque
 
 import discord
+from langchain_core.messages import AIMessage
 
 
 class FakeAudioSource:
@@ -231,3 +232,35 @@ async def settle(cycles=5):
 
 def queued_pairs(bot_module, guild_id):
     return [(track.url, track.title) for track in bot_module.players.get(guild_id).queue]
+
+
+class ScriptedChatModel:
+    def __init__(self, *steps, repeat=None):
+        self.steps = deque(steps)
+        self.repeat = repeat
+        self.calls = []
+
+    async def ainvoke(self, messages, config=None, **kwargs):
+        self.calls.append(list(messages))
+        if self.steps:
+            step = self.steps.popleft()
+        elif self.repeat is not None:
+            step = self.repeat.model_copy(deep=True)
+        else:
+            raise AssertionError("ScriptedChatModel ran out of steps")
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+
+def tool_call(name, call_id="call-1", **args):
+    return {"name": name, "args": args, "id": call_id, "type": "tool_call"}
+
+
+def ai_calls(*calls, text=""):
+    numbered = [{**call, "id": f"call-{index}"} for index, call in enumerate(calls)]
+    return AIMessage(content=text, tool_calls=numbered)
+
+
+def ai_text(text):
+    return AIMessage(content=text)
