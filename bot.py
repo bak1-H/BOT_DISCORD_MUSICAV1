@@ -7,8 +7,10 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 import base64
-import aiohttp
 import ai_dj
+from lol.embeds import build_comparison_embed, build_summoner_embed
+from lol.riot import RiotApi, RiotLookupError
+from lol.service import LolService
 from music import playlists as playlist_store, radio as radio_engine
 from music.discord_adapters import ChannelNotifier, DiscordVoiceGateway, ffmpeg_audio_source
 from music.embeds import format_duration, make_song_embed
@@ -419,77 +421,7 @@ async def clear(ctx, num: int):
     await ctx.send(f"🧹 Eliminados {count} mensajes.", delete_after=5)
 
 
-_RANK_EMOJI = {
-    "IRON": "🔩", "BRONZE": "🥉", "SILVER": "🥈", "GOLD": "🥇",
-    "PLATINUM": "🌿", "EMERALD": "💚", "DIAMOND": "💎",
-    "MASTER": "👑", "GRANDMASTER": "🏆", "CHALLENGER": "🔥",
-}
-
-_RANK_COLOR = {
-    "IRON": 0x4a4a4a, "BRONZE": 0xcd7f32, "SILVER": 0xa8a9ad,
-    "GOLD": 0xffd700, "PLATINUM": 0x4da6a8, "EMERALD": 0x149c50,
-    "DIAMOND": 0x5b85f5, "MASTER": 0x9c4dcc,
-    "GRANDMASTER": 0xd45a2a, "CHALLENGER": 0xf4c874,
-}
-
-_TIER_ORDER = ["IRON","BRONZE","SILVER","GOLD","PLATINUM","EMERALD","DIAMOND","MASTER","GRANDMASTER","CHALLENGER"]
-
-
-def _fmt_rank(entry: dict | None) -> str:
-    if not entry:
-        return "*Sin clasificar*"
-    tier = entry["tier"]
-    division = entry.get("rank", "")
-    lp = entry["leaguePoints"]
-    wins, losses = entry["wins"], entry["losses"]
-    wr = round(wins / (wins + losses) * 100) if (wins + losses) else 0
-    emoji = _RANK_EMOJI.get(tier, "")
-    return (
-        f"{emoji} **{tier.capitalize()} {division}**\n"
-        f"`{lp} LP` · {wins}V / {losses}D\n"
-        f"**{wr}%** winrate"
-    )
-
-
-def _best_tier(entries: list) -> str | None:
-    tiers = [e["tier"] for e in entries if "tier" in e]
-    return max(tiers, key=lambda t: _TIER_ORDER.index(t) if t in _TIER_ORDER else -1, default=None)
-
-
-async def _fetch_lol_player(session: aiohttp.ClientSession, riot_id: str, headers: dict) -> dict | str:
-    """Fetches account, summoner and ranked data. Returns a dict or an error string."""
-    game_name, tag_line = riot_id.rsplit("#", 1)
-    url = f"https://{RIOT_ROUTING}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-    async with session.get(url, headers=headers) as r:
-        if r.status == 404:
-            return f"❌ `{riot_id}` no encontrado."
-        if r.status in (401, 403):
-            return "❌ API key inválida o expirada."
-        if r.status != 200:
-            return f"❌ Error Riot API ({r.status})."
-        account = await r.json()
-
-    puuid = account["puuid"]
-
-    async with session.get(
-        f"https://{RIOT_PLATFORM}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{puuid}",
-        headers=headers,
-    ) as r:
-        summoner = await r.json() if r.status == 200 else {}
-
-    async with session.get(
-        f"https://{RIOT_PLATFORM}.api.riotgames.com/lol/league/v4/entries/by-puuid/{puuid}",
-        headers=headers,
-    ) as r:
-        entries = await r.json() if r.status == 200 else []
-
-    return {
-        "account": account,
-        "summoner": summoner,
-        "solo": next((e for e in entries if e["queueType"] == "RANKED_SOLO_5x5"), None),
-        "flex": next((e for e in entries if e["queueType"] == "RANKED_FLEX_SR"), None),
-        "entries": entries,
-    }
+lol_service = LolService(RiotApi(RIOT_API_KEY, RIOT_PLATFORM, RIOT_ROUTING))
 
 
 @bot.command()
@@ -497,98 +429,16 @@ async def invocador(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!invocador NombreJugador#TAG`")
     if "#" not in nombre:
-        return await ctx.send("❌ Incluí el tag. Ejemplo: `!invocador Faker#KR1`")
+        return await ctx.send("❌ Incluye el tag. Ejemplo: `!invocador Faker#KR1`")
     if not RIOT_API_KEY:
         return await ctx.send("❌ RIOT_API_KEY no configurada en el servidor.")
 
-    game_name, tag_line = nombre.rsplit("#", 1)
-    headers = {"X-Riot-Token": RIOT_API_KEY}
-
     await ctx.send(f"🔍 Buscando **{nombre}**...")
-
     try:
-        async with aiohttp.ClientSession() as session:
-            # 1. PUUID desde Riot ID
-            url = (
-                f"https://{RIOT_ROUTING}.api.riotgames.com"
-                f"/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-            )
-            async with session.get(url, headers=headers) as r:
-                if r.status == 404:
-                    return await ctx.send(f"❌ `{nombre}` no encontrado.")
-                if r.status in (401, 403):
-                    return await ctx.send("❌ API key inválida o expirada.")
-                if r.status != 200:
-                    return await ctx.send(f"❌ Error Riot API ({r.status}).")
-                account = await r.json()
-
-            # 2. Summoner por PUUID — solo para nivel e ícono (id ya no se devuelve)
-            url = (
-                f"https://{RIOT_PLATFORM}.api.riotgames.com"
-                f"/lol/summoner/v4/summoners/by-puuid/{account['puuid']}"
-            )
-            async with session.get(url, headers=headers) as r:
-                summoner = await r.json() if r.status == 200 else {}
-
-            # 3. Ranked por PUUID (endpoint nuevo, no requiere summonerId)
-            url = (
-                f"https://{RIOT_PLATFORM}.api.riotgames.com"
-                f"/lol/league/v4/entries/by-puuid/{account['puuid']}"
-            )
-            async with session.get(url, headers=headers) as r:
-                if r.status != 200:
-                    return await ctx.send(f"❌ Error obteniendo ranked ({r.status}).")
-                entries = await r.json()
-
-    except aiohttp.ClientError as e:
-        print(f"Riot API error: {e}")
-        return await ctx.send("❌ Error de red al consultar la API de Riot.")
-
-    solo = next((e for e in entries if e["queueType"] == "RANKED_SOLO_5x5"), None)
-    flex = next((e for e in entries if e["queueType"] == "RANKED_FLEX_SR"), None)
-    icon_id = summoner.get("profileIconId", 0)
-    level = summoner.get("summonerLevel", "?")
-
-    best = _best_tier(entries)
-    color = _RANK_COLOR.get(best, 0x5865f2) if best else 0x5865f2
-
-    embed = discord.Embed(
-        title=f"{account['gameName']}#{account['tagLine']}",
-        description=f"Nivel **{level}** · {RIOT_PLATFORM.upper()}",
-        color=color,
-    )
-    embed.add_field(name="🎯 Solo/Duo", value=_fmt_rank(solo), inline=True)
-    embed.add_field(name="👥 Flex 5v5", value=_fmt_rank(flex), inline=True)
-    embed.set_thumbnail(
-        url=f"https://ddragon.leagueoflegends.com/cdn/15.1.1/img/profileicon/{icon_id}.png"
-    )
-    embed.set_footer(
-        text="League of Legends · Riot Games API",
-        icon_url="https://cdn.communitydragon.org/latest/asset/ASSETS/Riot_Games/Logos/LoL_Icon_RGB.png",
-    )
-    await ctx.send(embed=embed)
-
-
-def _rank_score(entry: dict | None) -> float:
-    if not entry:
-        return -1.0
-    tier_idx = _TIER_ORDER.index(entry["tier"]) if entry["tier"] in _TIER_ORDER else 0
-    div_bonus = {"I": 3, "II": 2, "III": 1, "IV": 0}.get(entry.get("rank", "IV"), 0)
-    return tier_idx * 4 + div_bonus + entry["leaguePoints"] / 100
-
-
-def _wr(entry: dict | None) -> float:
-    if not entry:
-        return -1.0
-    w, l = entry["wins"], entry["losses"]
-    return round(w / (w + l) * 100, 1) if (w + l) else 0.0
-
-
-def _cmp(a, b) -> tuple[str, str]:
-    """Returns (indicator_a, indicator_b). 🟢 = wins, 🔴 = loses, ⚪ = tie."""
-    if a > b:   return "🟢", "🔴"
-    if b > a:   return "🔴", "🟢"
-    return "⚪", "⚪"
+        player = await lol_service.summoner(nombre)
+    except RiotLookupError as error:
+        return await ctx.send(f"❌ {error}")
+    await ctx.send(embed=build_summoner_embed(player, RIOT_PLATFORM))
 
 
 @bot.command()
@@ -603,70 +453,11 @@ async def vs(ctx, *, nombres: str = None):
         return await ctx.send("❌ Necesito dos Riot IDs. Ejemplo: `!vs maxipepsi#CHL FatReign#KFC`")
 
     await ctx.send(f"⚔️ Comparando **{ids[0]}** vs **{ids[1]}**...")
-
-    headers = {"X-Riot-Token": RIOT_API_KEY}
     try:
-        async with aiohttp.ClientSession() as session:
-            p1, p2 = await asyncio.gather(
-                _fetch_lol_player(session, ids[0], headers),
-                _fetch_lol_player(session, ids[1], headers),
-            )
-    except aiohttp.ClientError as e:
-        print(f"Riot VS error: {e}")
-        return await ctx.send("❌ Error de red al consultar la API de Riot.")
-
-    if isinstance(p1, str):
-        return await ctx.send(p1)
-    if isinstance(p2, str):
-        return await ctx.send(p2)
-
-    name1 = f"{p1['account']['gameName']}#{p1['account']['tagLine']}"
-    name2 = f"{p2['account']['gameName']}#{p2['account']['tagLine']}"
-
-    # ── comparación por categoría ──
-    solo_r1, solo_r2 = _cmp(_rank_score(p1["solo"]), _rank_score(p2["solo"]))
-    solo_w1, solo_w2 = _cmp(_wr(p1["solo"]), _wr(p2["solo"]))
-    flex_r1, flex_r2 = _cmp(_rank_score(p1["flex"]), _rank_score(p2["flex"]))
-    flex_w1, flex_w2 = _cmp(_wr(p1["flex"]), _wr(p2["flex"]))
-
-    pts1 = sum(2 if i == "🟢" else (1 if i == "⚪" else 0) for i in [solo_r1, solo_w1, flex_r1, flex_w1])
-    pts2 = sum(2 if i == "🟢" else (1 if i == "⚪" else 0) for i in [solo_r2, solo_w2, flex_r2, flex_w2])
-
-    def player_field(p, sr, sw, fr, fw) -> str:
-        lvl   = p["summoner"].get("summonerLevel", "?")
-        s     = p["solo"]
-        f     = p["flex"]
-        s_wr  = f"{_wr(s):.0f}%" if s else "—"
-        f_wr  = f"{_wr(f):.0f}%" if f else "—"
-        s_lbl = f"{_RANK_EMOJI.get(s['tier'],'')} {s['tier'].capitalize()} {s.get('rank','')} · {s['leaguePoints']} LP" if s else "Sin clasificar"
-        f_lbl = f"{_RANK_EMOJI.get(f['tier'],'')} {f['tier'].capitalize()} {f.get('rank','')} · {f['leaguePoints']} LP" if f else "Sin clasificar"
-        return (
-            f"Nivel **{lvl}**\n\n"
-            f"🎯 **Solo/Duo**\n{sr} {s_lbl}\n{sw} WR: **{s_wr}**\n\n"
-            f"👥 **Flex**\n{fr} {f_lbl}\n{fw} WR: **{f_wr}**"
-        )
-
-    if pts1 > pts2:
-        verdict = f"🏆 **{name1}** es superior ({pts1//2}-{pts2//2})"
-        winner_tier = _best_tier(p1["entries"])
-    elif pts2 > pts1:
-        verdict = f"🏆 **{name2}** es superior ({pts2//2}-{pts1//2})"
-        winner_tier = _best_tier(p2["entries"])
-    else:
-        verdict = "🤝 **Empate** — estadísticas muy parejas"
-        winner_tier = _best_tier(p1["entries"] + p2["entries"])
-
-    color = _RANK_COLOR.get(winner_tier, 0x5865f2) if winner_tier else 0x5865f2
-
-    embed = discord.Embed(title=f"⚔️ {name1}  vs  {name2}", color=color)
-    embed.add_field(name=name1, value=player_field(p1, solo_r1, solo_w1, flex_r1, flex_w1), inline=True)
-    embed.add_field(name=name2, value=player_field(p2, solo_r2, solo_w2, flex_r2, flex_w2), inline=True)
-    embed.add_field(name="Veredicto", value=verdict, inline=False)
-    embed.set_footer(
-        text="League of Legends · Riot Games API",
-        icon_url="https://cdn.communitydragon.org/latest/asset/ASSETS/Riot_Games/Logos/LoL_Icon_RGB.png",
-    )
-    await ctx.send(embed=embed)
+        comparison = await lol_service.compare(ids[0], ids[1])
+    except RiotLookupError as error:
+        return await ctx.send(f"❌ {error}")
+    await ctx.send(embed=build_comparison_embed(comparison))
 
 
 # ──────────────────── PLAYLISTS ────────────────────
