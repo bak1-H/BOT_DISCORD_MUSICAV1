@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from lol.riot import LolPlayer
+from lol.service import Comparison
 from music.service import MusicService
 
 MAX_TOOL_CALLS_PER_TURN = 6
@@ -23,6 +25,12 @@ class PlaylistsPort(Protocol):
     def load(self) -> dict: ...
 
     def save(self, data: dict) -> None: ...
+
+
+class LolPort(Protocol):
+    async def summoner(self, riot_id: str) -> LolPlayer: ...
+
+    async def compare(self, riot_id_a: str, riot_id_b: str) -> Comparison: ...
 
 
 @dataclass(frozen=True)
@@ -52,4 +60,5 @@ class RunContext:
     text_channel: object | None = None
     playlists: PlaylistsPort | None = None
     lyrics: LyricsPort | None = None
+    lol: LolPort | None = None
     ledger: TurnLedger = field(default_factory=TurnLedger)

@@ -448,6 +448,8 @@ def test_registry_exposes_exactly_the_specified_tools():
         "get_lyrics",
         "list_playlists",
         "show_playlist",
+        "lol_summoner",
+        "lol_compare",
         "play_song",
         "play_next",
         "queue_songs",

@@ -4,7 +4,7 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Annotated, Awaitable, Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError, field_validator
 
 from agent.context import (
     MAX_DESTRUCTIVE_PER_TURN,
@@ -13,6 +13,8 @@ from agent.context import (
     PendingAction,
     RunContext,
 )
+from lol.riot import RiotLookupError
+from lol.service import Comparison, rank_summary
 from music.lyrics import clean_title_for_lyrics
 from music.ports import ConnectResult
 from music.service import RemoveStatus
@@ -33,6 +35,8 @@ SCHEMA_KEYS_TO_DROP = frozenset({"title", "additionalProperties", "default"})
 
 NOT_IN_VOICE = "Entra a un canal de voz primero."
 NO_PLAYLIST_STORE = "Las playlists no están disponibles en este momento."
+NO_LOL_SERVICE = "La consulta de LoL no está disponible en este momento."
+RIOT_ID_PATTERN = re.compile(r"^.{3,16}#.{2,5}$")
 CONNECT_FAILURES = {
     ConnectResult.TIMEOUT: "No pude conectarme al canal de voz (timeout).",
     ConnectResult.REFUSED: "No pude conectarme al canal de voz (permisos o capacidad).",
@@ -114,6 +118,26 @@ class RemoveArgs(ToolArgs):
 class PlaylistRemoveArgs(ToolArgs):
     name: ShortText = Field(description="Nombre de la playlist")
     position: int = Field(ge=1, description="Posición en la playlist, empezando en 1")
+
+
+def validate_riot_id(value: str) -> str:
+    if not RIOT_ID_PATTERN.match(value):
+        raise ValueError("el Riot ID debe tener la forma Nombre#TAG")
+    return value
+
+
+class RiotIdArgs(ToolArgs):
+    riot_id: ShortText = Field(description="Riot ID con la forma Nombre#TAG, por ejemplo Faker#KR1")
+
+    _check_riot_id = field_validator("riot_id")(validate_riot_id)
+
+
+class CompareArgs(ToolArgs):
+    riot_id_a: ShortText = Field(description="Primer Riot ID con la forma Nombre#TAG")
+    riot_id_b: ShortText = Field(description="Segundo Riot ID con la forma Nombre#TAG")
+
+    _check_riot_id_a = field_validator("riot_id_a")(validate_riot_id)
+    _check_riot_id_b = field_validator("riot_id_b")(validate_riot_id)
 
 
 Handler = Callable[[RunContext, ToolArgs], Awaitable[ToolOutcome]]
@@ -352,6 +376,46 @@ async def playlist_load(ctx, args):
     return ToolOutcome(f"Playlist {quoted(name)} cargada: {len(songs)} canciones.")
 
 
+def describe_player(player) -> str:
+    level = player.level if player.level is not None else "desconocido"
+    return (
+        f"{clean_text(player.riot_id)}: nivel {level}. "
+        f"Solo/Duo: {clean_text(rank_summary(player.solo))}. "
+        f"Flex: {clean_text(rank_summary(player.flex))}."
+    )
+
+
+def describe_comparison(comparison: Comparison) -> str:
+    first, second = clean_text(comparison.first.riot_id), clean_text(comparison.second.riot_id)
+    if comparison.winner is None:
+        verdict = "Empate: estadísticas muy parejas."
+    elif comparison.winner is comparison.first:
+        verdict = f"{first} es superior ({comparison.points_first // 2}-{comparison.points_second // 2})."
+    else:
+        verdict = f"{second} es superior ({comparison.points_second // 2}-{comparison.points_first // 2})."
+    return "\n".join([describe_player(comparison.first), describe_player(comparison.second), verdict])
+
+
+async def lol_summoner(ctx, args):
+    if ctx.lol is None:
+        return failure(NO_LOL_SERVICE)
+    try:
+        player = await ctx.lol.summoner(args.riot_id)
+    except RiotLookupError as error:
+        return failure(clean_text(error, MAX_ERROR_CHARS))
+    return ToolOutcome(describe_player(player))
+
+
+async def lol_compare(ctx, args):
+    if ctx.lol is None:
+        return failure(NO_LOL_SERVICE)
+    try:
+        comparison = await ctx.lol.compare(args.riot_id_a, args.riot_id_b)
+    except RiotLookupError as error:
+        return failure(clean_text(error, MAX_ERROR_CHARS))
+    return ToolOutcome(describe_comparison(comparison))
+
+
 def propose(kind: str, prompt: str, **payload) -> ToolOutcome:
     action = PendingAction(kind=kind, prompt=prompt, payload=payload)
     return ToolOutcome(
@@ -553,6 +617,8 @@ def build_registry() -> ToolRegistry:
         ToolSpec("get_lyrics", "Busca la letra de una canción o de la actual.", SongArgs, get_lyrics, read_only=True),
         ToolSpec("list_playlists", "Lista las playlists del servidor.", NoArgs, list_playlists, read_only=True),
         ToolSpec("show_playlist", "Muestra las canciones de una playlist.", NameArgs, show_playlist, read_only=True),
+        ToolSpec("lol_summoner", "Consulta nivel y rango de League of Legends de un invocador por Riot ID (Nombre#TAG).", RiotIdArgs, lol_summoner, read_only=True),
+        ToolSpec("lol_compare", "Compara el rango de dos invocadores de League of Legends por Riot ID (Nombre#TAG).", CompareArgs, lol_compare, read_only=True),
         ToolSpec("play_song", "Busca una canción y la reproduce o la agrega al final de la cola.", QueryArgs, play_song),
         ToolSpec("play_next", "Busca una canción y la pone justo después de la actual (posición 1 de la cola).", QueryArgs, play_next),
         ToolSpec("queue_songs", "Agrega varias canciones a la cola (máximo 15 por llamada).", QueueSongsArgs, queue_songs),
