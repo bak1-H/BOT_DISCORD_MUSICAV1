@@ -4,8 +4,8 @@ import os
 from dataclasses import dataclass
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
-RADIO_TIMEOUT_S = 4.0
-PLAYLIST_TIMEOUT_S = 10.0
+RADIO_TIMEOUT_S = 12.0
+PLAYLIST_TIMEOUT_S = 15.0
 
 _SONG_LIST_SCHEMA = {
     "type": "object",
@@ -70,6 +70,7 @@ async def _generate_json(prompt: str, schema: dict, timeout_s: float) -> dict | 
                     response_mime_type="application/json",
                     response_json_schema=schema,
                     temperature=1.0,
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 ),
             ),
             timeout=timeout_s,
