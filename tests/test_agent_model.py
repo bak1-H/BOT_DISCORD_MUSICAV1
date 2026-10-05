@@ -32,8 +32,8 @@ def test_chat_model_is_built_with_design_parameters_and_bound_tools():
 
     chat = bound.bound
     assert chat.temperature == 0.2
-    assert chat.timeout == 20
-    assert chat.max_retries == 1
+    assert chat.timeout == 30
+    assert chat.max_retries == 2
     assert chat.model.endswith("gemini-test")
     assert sorted(tool["function"]["name"] for tool in bound.kwargs["tools"]) == sorted(registry.names())
 
@@ -61,3 +61,13 @@ def test_build_runner_returns_langgraph_runner():
     runner = build_runner({"GEMINI_API_KEY": "fake-key"})
 
     assert isinstance(runner, LangGraphAgentRunner)
+
+
+def test_timeout_budget_leaves_room_for_retried_model_calls():
+    from agent.listener import TURN_TIMEOUT_S as LISTENER_TURN_TIMEOUT_S
+    from agent.model import MAX_RETRIES, REQUEST_TIMEOUT_S
+    from agent.runner import TURN_TIMEOUT_S as RUNNER_TURN_TIMEOUT_S
+
+    assert MAX_RETRIES == 2
+    assert RUNNER_TURN_TIMEOUT_S > REQUEST_TIMEOUT_S * MAX_RETRIES
+    assert LISTENER_TURN_TIMEOUT_S > RUNNER_TURN_TIMEOUT_S

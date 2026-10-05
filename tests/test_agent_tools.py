@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -570,3 +571,119 @@ async def test_ledger_records_executed_mutations_but_not_reads_or_proposals(tmp_
 
     assert len(rig.ctx.ledger.executed) == 1
     assert "Pausado" in rig.ctx.ledger.executed[0]
+
+
+async def test_playlist_add_with_songs_saves_resolved_entries_without_playing(tmp_path):
+    playlists = FakePlaylists({"reguetton old": []})
+    rig = build_rig(tmp_path, playlists=playlists)
+    search_results(rig, **{"Daddy Yankee - Gasolina": ("g1", "Gasolina"), "Don Omar - Dale Don Dale": ("d1", "Dale Don Dale")})
+
+    outcome = await run(
+        rig, "playlist_add", name="Reguetton Old", songs=["Daddy Yankee - Gasolina", "Don Omar - Dale Don Dale"]
+    )
+
+    assert outcome.ok
+    assert [entry["title"] for entry in playlists.data["reguetton old"]] == ["Gasolina", "Dale Don Dale"]
+    assert playlists.data["reguetton old"][0]["url"] == song_url("g1")
+    assert rig.player.queue == []
+    assert rig.voice.client.play_calls == 0
+    assert "2" in outcome.text
+
+
+async def test_playlist_add_with_songs_skips_duplicates_and_reports_failed_searches(tmp_path):
+    existing = {"title": "Gasolina", "url": song_url("g1")}
+    playlists = FakePlaylists({"mix": [existing]})
+    rig = build_rig(tmp_path, playlists=playlists)
+    search_results(rig, gasolina=("g1", "Gasolina"), otra=("o1", "Otra"))
+
+    outcome = await run(rig, "playlist_add", name="mix", songs=["gasolina", "otra", "inexistente"])
+
+    assert outcome.ok
+    assert [entry["title"] for entry in playlists.data["mix"]] == ["Gasolina", "Otra"]
+    assert "ya estaba" in outcome.text.lower() or "omití" in outcome.text.lower()
+    assert "inexistente" in outcome.text
+    assert rig.player.queue == []
+
+
+async def test_playlist_add_with_songs_reports_search_errors_per_song(tmp_path):
+    playlists = FakePlaylists({"mix": []})
+    rig = build_rig(tmp_path, playlists=playlists)
+    rig.extractor.search_error = RuntimeError("boom")
+
+    outcome = await run(rig, "playlist_add", name="mix", songs=["uno"])
+
+    assert not outcome.ok
+    assert "uno" in outcome.text
+    assert playlists.data["mix"] == []
+
+
+async def test_playlist_add_with_songs_rejects_more_than_fifteen_or_empty_entries(tmp_path):
+    playlists = FakePlaylists({"mix": []})
+    rig = build_rig(tmp_path, playlists=playlists)
+
+    too_many = await run(rig, "playlist_add", name="mix", songs=["a"] * 16)
+    empty_entry = await run(rig, "playlist_add", name="mix", songs=[""])
+
+    assert not too_many.ok
+    assert not empty_entry.ok
+    assert rig.extractor.search_calls == []
+
+
+async def test_playlist_add_with_songs_fails_when_playlist_is_missing_without_searching(tmp_path):
+    rig = build_rig(tmp_path, playlists=FakePlaylists())
+
+    outcome = await run(rig, "playlist_add", name="nope", songs=["a"])
+
+    assert not outcome.ok
+    assert rig.extractor.search_calls == []
+
+
+async def test_playlist_add_with_songs_respects_twenty_songs_budget_per_turn(tmp_path):
+    playlists = FakePlaylists({"mix": []})
+    rig = build_rig(tmp_path, playlists=playlists)
+    names = [f"song {index}" for index in range(30)]
+    rig.extractor.search_by_query = {
+        name: [FakeExtractor.entry(f"v{index}", title=name)] for index, name in enumerate(names)
+    }
+
+    await run(rig, "playlist_add", name="mix", songs=names[:15])
+    second = await run(rig, "playlist_add", name="mix", songs=names[15:30])
+
+    assert len(playlists.data["mix"]) == 20
+    assert "Omití 10" in second.text
+
+
+async def test_playlist_add_without_songs_keeps_saving_the_current_song(tmp_path):
+    playlists = FakePlaylists({"mix": []})
+    rig = build_rig(tmp_path, playlists=playlists)
+    prime_current(rig, "Tusa")
+
+    outcome = await run(rig, "playlist_add", name="mix")
+
+    assert outcome.ok
+    assert playlists.data["mix"] == [{"title": "Tusa", "url": song_url("cur")}]
+    assert rig.extractor.search_calls == []
+
+
+async def test_playlist_add_with_songs_keeps_songs_saved_before_a_cancellation(tmp_path):
+    playlists = FakePlaylists({"mix": []})
+    rig = build_rig(tmp_path, playlists=playlists)
+    stuck = asyncio.Event()
+    real_search = rig.extractor.search
+    rig.extractor.search_by_query = {"primera": [FakeExtractor.entry("p1", title="Primera")]}
+
+    async def search(query, count):
+        if query == "segunda":
+            stuck.set()
+            await asyncio.Event().wait()
+        return await real_search(query, count)
+
+    rig.extractor.search = search
+
+    task = asyncio.create_task(run(rig, "playlist_add", name="mix", songs=["primera", "segunda"]))
+    await stuck.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert [entry["title"] for entry in playlists.data["mix"]] == ["Primera"]

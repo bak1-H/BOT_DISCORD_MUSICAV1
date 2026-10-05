@@ -5,8 +5,8 @@ from agent.tools import ToolRegistry, build_registry
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 TEMPERATURE = 0.2
-REQUEST_TIMEOUT_S = 20
-MAX_RETRIES = 1
+REQUEST_TIMEOUT_S = 30
+MAX_RETRIES = 2
 FIXED_SAMPLING_FAMILY = "gemini-3"
 
 

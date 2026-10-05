@@ -126,6 +126,12 @@ class MusicService:
         await self.ensure_playing()
         return EnqueueResult(track=track, preview=preview, busy=busy)
 
+    async def resolve_song(self, query: str) -> tuple[str, str] | None:
+        entries = await self.extractor.search(query, 1)
+        if not entries:
+            return None
+        return self._entry_url_and_title(entries[0])
+
     async def queue_songs(self, songs: list, max_duration_s: int | None = None) -> QueueSongsResult:
         result = QueueSongsResult()
         accepted = songs[:MAX_QUEUE_SONGS_PER_CALL]

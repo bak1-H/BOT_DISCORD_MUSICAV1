@@ -45,6 +45,7 @@ class TurnLedger:
     tool_calls: int = 0
     destructive: int = 0
     songs_queued: int = 0
+    songs_saved: int = 0
     limit_hit: bool = False
     executed: list = field(default_factory=list)
     pending: list = field(default_factory=list)

@@ -1,3 +1,4 @@
+import asyncio
 import re
 import traceback
 import unicodedata
@@ -16,6 +17,7 @@ from agent.context import (
 from lol.riot import RiotLookupError
 from lol.service import Comparison, rank_summary
 from music.lyrics import clean_title_for_lyrics
+from music import playlists as playlist_store
 from music.ports import ConnectResult
 from music.service import RemoveStatus
 
@@ -90,6 +92,15 @@ class NameArgs(ToolArgs):
     name: ShortText = Field(description="Nombre de la playlist")
 
 
+class PlaylistAddArgs(ToolArgs):
+    name: ShortText = Field(description="Nombre de la playlist")
+    songs: list[ShortText] = Field(
+        default_factory=list,
+        max_length=MAX_SONGS_PER_CALL,
+        description="Búsquedas de canciones a guardar, formato Artista - Canción; vacío guarda la canción actual",
+    )
+
+
 class QueueSongsArgs(ToolArgs):
     songs: list[ShortText] = Field(
         min_length=1, max_length=MAX_SONGS_PER_CALL, description="Búsquedas de canciones, una por elemento"
@@ -160,6 +171,18 @@ async def ensure_voice(ctx: RunContext) -> str | None:
     return CONNECT_FAILURES.get(result)
 
 
+async def load_playlists(ctx: RunContext) -> dict:
+    return await asyncio.to_thread(ctx.playlists.load)
+
+
+async def save_playlists(ctx: RunContext, data: dict) -> None:
+    await asyncio.to_thread(ctx.playlists.save, data)
+
+
+def playlist_lock(ctx: RunContext) -> asyncio.Lock:
+    return playlist_store.guild_lock(ctx.guild_id)
+
+
 def format_queue(ctx: RunContext) -> str:
     player = ctx.music.player
     lines = []
@@ -214,7 +237,7 @@ async def get_lyrics(ctx, args):
 async def list_playlists(ctx, args):
     if ctx.playlists is None:
         return failure(NO_PLAYLIST_STORE)
-    data = ctx.playlists.load()
+    data = await load_playlists(ctx)
     if not data:
         return failure("No hay playlists guardadas en este servidor.")
     lines = [f"{clean_text(name)}: {len(songs)} canciones" for name, songs in data.items()]
@@ -225,7 +248,7 @@ async def show_playlist(ctx, args):
     if ctx.playlists is None:
         return failure(NO_PLAYLIST_STORE)
     name = normalize_name(args.name)
-    data = ctx.playlists.load()
+    data = await load_playlists(ctx)
     if name not in data:
         return failure(f"No existe la playlist {quoted(name)}.")
     songs = data[name]
@@ -334,37 +357,97 @@ async def playlist_create(ctx, args):
     if ctx.playlists is None:
         return failure(NO_PLAYLIST_STORE)
     name = normalize_name(args.name)
-    data = ctx.playlists.load()
-    if name in data:
-        return failure(f"Ya existe la playlist {quoted(name)}.")
-    data[name] = []
-    ctx.playlists.save(data)
+    async with playlist_lock(ctx):
+        data = await load_playlists(ctx)
+        if name in data:
+            return failure(f"Ya existe la playlist {quoted(name)}.")
+        data[name] = []
+        await save_playlists(ctx, data)
     return ToolOutcome(f"Playlist {quoted(name)} creada.")
 
 
 async def playlist_add(ctx, args):
     if ctx.playlists is None:
         return failure(NO_PLAYLIST_STORE)
+    if args.songs:
+        return await playlist_add_songs(ctx, args)
     name = normalize_name(args.name)
     song = ctx.music.player.current
     if not song:
         return failure("No hay ninguna canción sonando ahora.")
-    data = ctx.playlists.load()
-    if name not in data:
-        return failure(f"No existe la playlist {quoted(name)}.")
     entry = {"title": song["title"], "url": song["url"]}
-    if entry in data[name]:
-        return failure(f"{quoted(song['title'])} ya está en {quoted(name)}.")
-    data[name].append(entry)
-    ctx.playlists.save(data)
+    async with playlist_lock(ctx):
+        data = await load_playlists(ctx)
+        if name not in data:
+            return failure(f"No existe la playlist {quoted(name)}.")
+        if entry in data[name]:
+            return failure(f"{quoted(song['title'])} ya está en {quoted(name)}.")
+        data[name].append(entry)
+        await save_playlists(ctx, data)
     return ToolOutcome(f"{quoted(song['title'])} agregada a {quoted(name)} ({len(data[name])} canciones).")
+
+
+async def resolve_playlist_entry(ctx, query):
+    try:
+        resolved = await ctx.music.resolve_song(query)
+    except Exception:
+        traceback.print_exc()
+        return None
+    if resolved is None:
+        return None
+    url, title = resolved
+    return {"title": title, "url": url}
+
+
+async def store_playlist_entry(ctx, name, entry):
+    async with playlist_lock(ctx):
+        data = await load_playlists(ctx)
+        if name not in data:
+            return None, 0
+        if entry in data[name]:
+            return False, len(data[name])
+        data[name].append(entry)
+        await save_playlists(ctx, data)
+        return True, len(data[name])
+
+
+async def playlist_add_songs(ctx, args):
+    name = normalize_name(args.name)
+    if name not in await load_playlists(ctx):
+        return failure(f"No existe la playlist {quoted(name)}.")
+    ledger = ctx.ledger
+    budget = max(MAX_SONGS_PER_TURN - ledger.songs_saved, 0)
+    accepted = args.songs[:budget]
+    over_budget = len(args.songs) - len(accepted)
+    if not accepted:
+        return failure("Ya alcancé el máximo de canciones por pedido.")
+    ledger.songs_saved += len(accepted)
+    added, duplicated, failed = [], [], []
+    total = 0
+    for query in accepted:
+        entry = await resolve_playlist_entry(ctx, query)
+        if entry is None:
+            failed.append(query)
+            continue
+        stored, total = await store_playlist_entry(ctx, name, entry)
+        if stored is None:
+            return failure(f"La playlist {quoted(name)} ya no existe.")
+        (added if stored else duplicated).append(entry["title"])
+    parts = [f"Agregué {len(added)} canciones a {quoted(name)} ({total} en total)."]
+    if duplicated:
+        parts.append("Ya estaban: " + ", ".join(clean_text(title) for title in duplicated) + ".")
+    if failed:
+        parts.append("No encontré: " + ", ".join(clean_text(query) for query in failed) + ".")
+    if over_budget:
+        parts.append(f"Omití {over_budget} por el límite de canciones por pedido.")
+    return ToolOutcome(" ".join(parts), ok=bool(added or duplicated))
 
 
 async def playlist_load(ctx, args):
     if ctx.playlists is None:
         return failure(NO_PLAYLIST_STORE)
     name = normalize_name(args.name)
-    songs = ctx.playlists.load().get(name)
+    songs = (await load_playlists(ctx)).get(name)
     if not songs:
         return failure(f"La playlist {quoted(name)} no existe o está vacía.")
     problem = await ensure_voice(ctx)
@@ -454,7 +537,7 @@ async def playlist_remove(ctx, args):
     if ctx.playlists is None:
         return failure(NO_PLAYLIST_STORE)
     name = normalize_name(args.name)
-    songs = ctx.playlists.load().get(name)
+    songs = (await load_playlists(ctx)).get(name)
     if songs is None:
         return failure(f"No existe la playlist {quoted(name)}.")
     if args.position > len(songs):
@@ -473,7 +556,7 @@ async def playlist_delete(ctx, args):
     if ctx.playlists is None:
         return failure(NO_PLAYLIST_STORE)
     name = normalize_name(args.name)
-    songs = ctx.playlists.load().get(name)
+    songs = (await load_playlists(ctx)).get(name)
     if songs is None:
         return failure(f"No existe la playlist {quoted(name)}.")
     return propose(
@@ -503,24 +586,26 @@ async def _execute_clear_queue(ctx, payload):
 async def _execute_playlist_remove(ctx, payload):
     if ctx.playlists is None:
         return NO_PLAYLIST_STORE
-    data = ctx.playlists.load()
-    songs = data.get(payload["name"], [])
-    position = payload["position"]
-    if position > len(songs) or songs[position - 1]["title"] != payload["title"]:
-        return "La playlist cambió; no quité nada."
-    removed = songs.pop(position - 1)
-    ctx.playlists.save(data)
+    async with playlist_lock(ctx):
+        data = await load_playlists(ctx)
+        songs = data.get(payload["name"], [])
+        position = payload["position"]
+        if position > len(songs) or songs[position - 1]["title"] != payload["title"]:
+            return "La playlist cambió; no quité nada."
+        removed = songs.pop(position - 1)
+        await save_playlists(ctx, data)
     return f"Quité {quoted(removed['title'])} de {quoted(payload['name'])}."
 
 
 async def _execute_playlist_delete(ctx, payload):
     if ctx.playlists is None:
         return NO_PLAYLIST_STORE
-    data = ctx.playlists.load()
-    if payload["name"] not in data:
-        return f"No existe la playlist {quoted(payload['name'])}."
-    del data[payload["name"]]
-    ctx.playlists.save(data)
+    async with playlist_lock(ctx):
+        data = await load_playlists(ctx)
+        if payload["name"] not in data:
+            return f"No existe la playlist {quoted(payload['name'])}."
+        del data[payload["name"]]
+        await save_playlists(ctx, data)
     return f"Playlist {quoted(payload['name'])} eliminada."
 
 
@@ -629,7 +714,12 @@ def build_registry() -> ToolRegistry:
         ToolSpec("start_radio", "Activa una radio automática de un estilo o artista.", RadioArgs, start_radio),
         ToolSpec("stop_radio", "Desactiva la radio automática.", NoArgs, stop_radio),
         ToolSpec("playlist_create", "Crea una playlist vacía.", NameArgs, playlist_create),
-        ToolSpec("playlist_add", "Agrega la canción actual a una playlist.", NameArgs, playlist_add),
+        ToolSpec(
+            "playlist_add",
+            "Guarda en una playlist las canciones indicadas en songs, o la canción actual si no se indican. No reproduce nada.",
+            PlaylistAddArgs,
+            playlist_add,
+        ),
         ToolSpec("playlist_load", "Carga una playlist en la cola.", NameArgs, playlist_load),
         ToolSpec(
             "remove_from_queue",

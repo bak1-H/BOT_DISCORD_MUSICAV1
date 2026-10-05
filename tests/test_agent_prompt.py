@@ -85,3 +85,13 @@ async def test_turn_prompt_neutralizes_fake_closing_tags_and_sanitizes_title(tmp
     assert prompt.count("</user_message>") == 1
     assert prompt.count("</runtime_context>") == 1
     assert prompt.count("<runtime_context>") == 1
+
+
+def test_system_prompt_states_the_multi_step_and_no_leak_rules():
+    prompt = build_system_prompt()
+
+    assert "encadena" in prompt.lower()
+    assert "Artista - Canción" in prompt
+    assert "nombres de herramientas" in prompt
+    assert "nunca digas que no puedes" in prompt.lower()
+    assert "créala" in prompt

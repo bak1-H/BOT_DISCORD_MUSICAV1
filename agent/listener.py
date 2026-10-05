@@ -15,8 +15,8 @@ RATE_LIMITED = "Vas muy rápido, intenta de nuevo en unos segundos."
 GUILD_BUSY = "Estoy atendiendo otro pedido en este servidor, intenta en unos segundos."
 USER_INTERVAL_S = 5
 MAX_TRACKED_USERS = 1000
-LOCK_WAIT_S = 15
-TURN_TIMEOUT_S = 60
+LOCK_WAIT_S = 45
+TURN_TIMEOUT_S = 90
 DISCORD_MESSAGE_LIMIT = 2000
 
 
@@ -26,23 +26,39 @@ class UserRateLimiter:
         self._clock = clock
         self._max_tracked = max_tracked
         self._last_turn: dict[int, float] = {}
+        self._last_warning: dict[int, float] = {}
 
     @property
     def tracked(self) -> int:
         return len(self._last_turn)
 
-    def allow(self, user_id: int) -> bool:
-        now = self._clock()
+    def limited(self, user_id: int) -> bool:
         last = self._last_turn.get(user_id)
-        if last is not None and now - last < self._interval_s:
-            return False
+        return last is not None and self._clock() - last < self._interval_s
+
+    def consume(self, user_id: int) -> None:
+        now = self._clock()
         if len(self._last_turn) >= self._max_tracked:
             self._forget_stale(now)
         self._last_turn[user_id] = now
+
+    def allow(self, user_id: int) -> bool:
+        if self.limited(user_id):
+            return False
+        self.consume(user_id)
+        return True
+
+    def claim_warning(self, user_id: int) -> bool:
+        last_turn = self._last_turn.get(user_id)
+        last_warning = self._last_warning.get(user_id)
+        if last_turn is not None and last_warning is not None and last_warning >= last_turn:
+            return False
+        self._last_warning[user_id] = self._clock()
         return True
 
     def _forget_stale(self, now: float) -> None:
         self._last_turn = {user: at for user, at in self._last_turn.items() if now - at < self._interval_s}
+        self._last_warning = {user: at for user, at in self._last_warning.items() if user in self._last_turn}
 
 
 @asynccontextmanager
@@ -111,12 +127,15 @@ class AgentListener:
         text = extract_request(message, self._bot.user)
         if text is None:
             return
-        if not self._rate_limiter.allow(message.author.id):
-            await deliver(message, RATE_LIMITED)
+        author_id = message.author.id
+        if self._rate_limiter.limited(author_id):
+            if self._rate_limiter.claim_warning(author_id):
+                await deliver(message, RATE_LIMITED)
             return
         if not text:
             await deliver(message, EMPTY_REQUEST)
             return
+        self._rate_limiter.consume(author_id)
         try:
             ctx = self._context_factory(message)
         except Exception:

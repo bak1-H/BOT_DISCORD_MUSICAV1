@@ -116,7 +116,19 @@ async def test_bare_name_gets_a_hint_without_calling_the_agent(tmp_path):
     assert sent_texts(incoming) == [EMPTY_REQUEST]
 
 
-async def test_repeated_bare_name_is_rate_limited_too(tmp_path):
+async def test_bare_name_does_not_consume_the_rate_limit_slot(tmp_path):
+    listener, runner, _ = build_listener(tmp_path)
+    bare, real = triggered("makakiño"), triggered("makakiño pon Tusa")
+
+    await listener.on_message(bare)
+    await listener.on_message(real)
+
+    assert sent_texts(bare) == [EMPTY_REQUEST]
+    assert sent_texts(real) == ["respuesta"]
+    assert len(runner.calls) == 1
+
+
+async def test_bare_name_is_answered_while_the_user_is_not_rate_limited(tmp_path):
     listener, runner, _ = build_listener(tmp_path)
     first, second = triggered("makakiño"), triggered("makakiño")
 
@@ -124,8 +136,50 @@ async def test_repeated_bare_name_is_rate_limited_too(tmp_path):
     await listener.on_message(second)
 
     assert sent_texts(first) == [EMPTY_REQUEST]
-    assert sent_texts(second) == [RATE_LIMITED]
+    assert sent_texts(second) == [EMPTY_REQUEST]
     assert runner.calls == []
+
+
+async def test_rate_limited_user_is_warned_once_per_window_and_then_ignored(tmp_path):
+    clock = Clock()
+    listener, runner, _ = build_listener(tmp_path, rate_limiter=UserRateLimiter(interval_s=5, clock=clock))
+    first, second, third, fourth = triggered(), triggered(), triggered(), triggered()
+
+    await listener.on_message(first)
+    await listener.on_message(second)
+    await listener.on_message(third)
+    await listener.on_message(fourth)
+
+    assert sent_texts(second) == [RATE_LIMITED]
+    assert sent_texts(third) == []
+    assert sent_texts(fourth) == []
+    assert len(runner.calls) == 1
+
+
+async def test_rate_limit_warning_is_available_again_in_the_next_window(tmp_path):
+    clock = Clock()
+    listener, runner, _ = build_listener(tmp_path, rate_limiter=UserRateLimiter(interval_s=5, clock=clock))
+
+    await listener.on_message(triggered())
+    await listener.on_message(triggered())
+    clock.now += 5
+    await listener.on_message(triggered())
+    warned_again = triggered()
+    await listener.on_message(warned_again)
+
+    assert sent_texts(warned_again) == [RATE_LIMITED]
+    assert len(runner.calls) == 2
+
+
+async def test_bare_name_from_a_rate_limited_user_gets_no_extra_reply(tmp_path):
+    listener, runner, _ = build_listener(tmp_path)
+    await listener.on_message(triggered())
+    await listener.on_message(triggered())
+    bare = triggered("makakiño")
+
+    await listener.on_message(bare)
+
+    assert sent_texts(bare) == []
 
 
 async def test_typing_indicator_wraps_the_turn(tmp_path):
@@ -341,3 +395,10 @@ async def test_message_from_the_bot_user_is_ignored(tmp_path):
     await listener.on_message(triggered(author=FakeSender(user_id=BOT_ID, is_bot=True)))
 
     assert runner.calls == []
+
+
+def test_guild_lock_wait_covers_a_full_turn_of_the_previous_request():
+    from agent.listener import LOCK_WAIT_S, TURN_TIMEOUT_S
+
+    assert LOCK_WAIT_S == 45
+    assert LOCK_WAIT_S < TURN_TIMEOUT_S

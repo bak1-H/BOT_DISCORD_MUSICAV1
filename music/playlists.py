@@ -1,5 +1,15 @@
+import asyncio
 import json
 import os
+import tempfile
+import weakref
+
+_guild_locks = weakref.WeakKeyDictionary()
+
+
+def guild_lock(gid: int) -> asyncio.Lock:
+    per_loop = _guild_locks.setdefault(asyncio.get_running_loop(), {})
+    return per_loop.setdefault(gid, asyncio.Lock())
 
 
 def playlist_path(playlists_dir: str, gid: int) -> str:
@@ -15,5 +25,14 @@ def load_playlists(playlists_dir: str, gid: int) -> dict:
 
 
 def save_playlists(playlists_dir: str, gid: int, data: dict) -> None:
-    with open(playlist_path(playlists_dir, gid), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    descriptor, temp_path = tempfile.mkstemp(dir=playlists_dir, prefix=f"{gid}.", suffix=".tmp")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, playlist_path(playlists_dir, gid))
+    except BaseException:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise

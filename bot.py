@@ -8,6 +8,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import base64
 import ai_dj
+import help_content
 from lol.embeds import build_comparison_embed, build_summoner_embed
 from lol.riot import RiotApi, RiotLookupError
 from lol.service import LolService
@@ -391,6 +392,19 @@ async def comandos(ctx):
     await ctx.send(embed=embed)
 
 
+def build_help_embed():
+    embed = discord.Embed(title=help_content.HELP_TITLE, color=discord.Color.blurple())
+    for title, body in help_content.HELP_SECTIONS:
+        embed.add_field(name=title, value=body, inline=False)
+    embed.add_field(name="Comandos sin IA", value=", ".join(help_content.FALLBACK_COMMANDS), inline=False)
+    return embed
+
+
+@bot.command()
+async def ayuda(ctx):
+    await ctx.send(embed=build_help_embed())
+
+
 @bot.command()
 async def repo(ctx):
     await ctx.send("🔗 Repositorio: https://github.com/bak1-H/BOT_DISCORD_MUSICA")
@@ -488,11 +502,12 @@ async def pl_create(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist create <nombre>`")
     nombre = nombre.lower().strip()
-    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
-    if nombre in data:
-        return await ctx.send(f"❌ Ya existe la playlist **{nombre}**.")
-    data[nombre] = []
-    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
+    async with playlist_store.guild_lock(ctx.guild.id):
+        data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
+        if nombre in data:
+            return await ctx.send(f"❌ Ya existe la playlist **{nombre}**.")
+        data[nombre] = []
+        playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"✅ Playlist **{nombre}** creada. Agrega canciones con `!playlist add {nombre}`.")
 
 
@@ -504,14 +519,15 @@ async def pl_add(ctx, *, nombre: str = None):
     song = players.get(ctx.guild.id).current
     if not song:
         return await ctx.send("❌ No hay ninguna canción sonando ahora.")
-    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
-    if nombre not in data:
-        return await ctx.send(f"❌ No existe la playlist **{nombre}**. Créala con `!playlist create {nombre}`.")
     entry = {"title": song["title"], "url": song["url"]}
-    if entry in data[nombre]:
-        return await ctx.send(f"⚠️ **{song['title']}** ya está en **{nombre}**.")
-    data[nombre].append(entry)
-    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
+    async with playlist_store.guild_lock(ctx.guild.id):
+        data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
+        if nombre not in data:
+            return await ctx.send(f"❌ No existe la playlist **{nombre}**. Créala con `!playlist create {nombre}`.")
+        if entry in data[nombre]:
+            return await ctx.send(f"⚠️ **{song['title']}** ya está en **{nombre}**.")
+        data[nombre].append(entry)
+        playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"✅ **{song['title']}** agregada a **{nombre}** ({len(data[nombre])} canciones).")
 
 
@@ -567,14 +583,15 @@ async def pl_remove(ctx, nombre: str = None, posicion: int = None):
     if not nombre or posicion is None:
         return await ctx.send("❌ Uso: `!playlist remove <nombre> <posición>`")
     nombre = nombre.lower().strip()
-    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
-    if nombre not in data:
-        return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
-    songs = data[nombre]
-    if posicion < 1 or posicion > len(songs):
-        return await ctx.send(f"❌ Posición inválida. La playlist tiene {len(songs)} canciones.")
-    removed = songs.pop(posicion - 1)
-    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
+    async with playlist_store.guild_lock(ctx.guild.id):
+        data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
+        if nombre not in data:
+            return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
+        songs = data[nombre]
+        if posicion < 1 or posicion > len(songs):
+            return await ctx.send(f"❌ Posición inválida. La playlist tiene {len(songs)} canciones.")
+        removed = songs.pop(posicion - 1)
+        playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"🗑️ **{removed['title']}** eliminada de **{nombre}**.")
 
 
@@ -583,11 +600,12 @@ async def pl_delete(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist delete <nombre>`")
     nombre = nombre.lower().strip()
-    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
-    if nombre not in data:
-        return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
-    del data[nombre]
-    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
+    async with playlist_store.guild_lock(ctx.guild.id):
+        data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
+        if nombre not in data:
+            return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
+        del data[nombre]
+        playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"🗑️ Playlist **{nombre}** eliminada.")
 
 
@@ -625,7 +643,7 @@ def install_agent(env=os.environ):
         context_factory = RunContextFactory(get_music_service, lol_service, GeniusLyrics(), lambda: PLAYLISTS_DIR)
         listener = AgentListener(runner, context_factory, bot)
     except Exception as error:
-        print(f"[agente] deshabilitado: {type(error).__name__}: {error}")
+        print(f"[agente] deshabilitado: {type(error).__name__}")
         return None
     bot.add_listener(listener.on_message, "on_message")
     print("[agente] activo")
