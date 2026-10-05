@@ -16,7 +16,7 @@ import pytest
 
 import bot as bot_module
 from music.player import PlayerRegistry
-from tests.fakes import FakeAudioSource, FakeContext, FakeExtractor
+from tests.fakes import FakeAudioSource, FakeContext, FakeExtractor, FakeGuild
 
 ORIGINAL_DOWNLOAD_DIR = bot_module.DOWNLOAD_DIR
 ORIGINAL_PLAYLISTS_DIR = bot_module.PLAYLISTS_DIR
@@ -26,6 +26,8 @@ def reset_per_guild_state():
         if player.alone_task is not None:
             player.alone_task.cancel()
     bot_module.players = PlayerRegistry()
+    bot_module.music_services = {}
+    FakeGuild.forget_all()
 
 
 @pytest.fixture(autouse=True)
@@ -37,7 +39,8 @@ async def isolated_bot(tmp_path, monkeypatch):
     monkeypatch.setattr(bot_module, "DOWNLOAD_DIR", str(download_dir))
     monkeypatch.setattr(bot_module, "PLAYLISTS_DIR", str(playlists_dir))
     monkeypatch.setattr(bot_module.discord, "FFmpegPCMAudio", FakeAudioSource)
-    bot_module.bot.loop = asyncio.get_running_loop()
+    monkeypatch.setattr(bot_module.bot, "get_guild", FakeGuild.lookup)
+    bot_module.bot.playback_loop = asyncio.get_running_loop()
     reset_per_guild_state()
     yield bot_module
     reset_per_guild_state()
@@ -46,14 +49,15 @@ async def isolated_bot(tmp_path, monkeypatch):
 @pytest.fixture
 def patch_extractor(monkeypatch):
     extractor = FakeExtractor(bot_module.DOWNLOAD_DIR)
-    monkeypatch.setattr(bot_module, "ytdlp_extract", extractor.ytdlp_extract)
-    monkeypatch.setattr(bot_module, "download_audio_with_fallback", extractor.download_audio_with_fallback)
+    monkeypatch.setattr(bot_module, "extractor", extractor)
     return extractor
 
 
 @pytest.fixture
-def ctx():
-    return FakeContext(guild_id=1, connected=True)
+def ctx(isolated_bot):
+    context = FakeContext(guild_id=1, connected=True)
+    isolated_bot.players.get(1).text_channel = context.channel
+    return context
 
 
 @pytest.fixture

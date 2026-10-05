@@ -9,11 +9,15 @@ from dotenv import load_dotenv
 import base64
 import aiohttp
 import ai_dj
-from music import playlists as playlist_store, radio as radio_engine, ytdl
+from music import playlists as playlist_store, radio as radio_engine
+from music.discord_adapters import ChannelNotifier, DiscordVoiceGateway, ffmpeg_audio_source
 from music.embeds import format_duration, make_song_embed
+from music.extractor import YtdlpExtractor
 from music.lyrics import clean_title_for_lyrics, get_genius
 from music.player import PlayerRegistry
-from music.ytdl import YtdlpSettings, is_youtube_login_block, normalize_youtube_url
+from music.ports import ConnectResult
+from music.service import MusicService
+from music.ytdl import YtdlpSettings, is_youtube_login_block
 
 load_dotenv()
 
@@ -51,7 +55,18 @@ if not COOKIES_FILE:
 # ──────────────────── DISCORD ────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents, case_insensitive=True)
+
+
+class MusicBot(commands.Bot):
+    def __init__(self, **options):
+        super().__init__(**options)
+        self.playback_loop = None
+
+    async def setup_hook(self):
+        self.playback_loop = asyncio.get_running_loop()
+
+
+bot = MusicBot(command_prefix="!", intents=intents, case_insensitive=True, help_command=None)
 
 # ──────────────────── CONFIG ────────────────────
 YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip() or None
@@ -82,120 +97,25 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ──────────────────── AUDIO EXTRACTION ────────────────────
 
-async def ytdlp_extract(query: str, is_search: bool = False, client: str = "web", search_count: int = 1) -> dict:
-    return await ytdl.ytdlp_extract(YTDLP_SETTINGS, query, is_search, client, search_count)
+extractor = YtdlpExtractor(YTDLP_SETTINGS, DOWNLOAD_DIR)
+
+music_services = {}
 
 
-async def download_audio_with_fallback(gid: int, url: str) -> tuple[dict, str, str]:
-    return await ytdl.download_audio_with_fallback(YTDLP_SETTINGS, DOWNLOAD_DIR, gid, url)
-
-
-async def radio_next(ctx) -> bool:
-    return await radio_engine.radio_next(players.get(ctx.guild.id), ytdlp_extract)
-
-
-# ──────────────────── PLAY NEXT ────────────────────
-
-async def play_next(ctx):
-    """Serializa el arranque de la siguiente cancion. Lo llama el callback `after`."""
-    async with players.get(ctx.guild.id).playback_lock:
-        await _play_next_locked(ctx)
-
-
-async def ensure_playing(ctx):
-    """Arranca la reproduccion solo si no hay nada sonando ni cargando (serializado)."""
-    gid = ctx.guild.id
-    async with players.get(gid).playback_lock:
-        vc = ctx.voice_client
-        if not vc or not vc.is_connected():
-            return
-        if vc.is_playing() or vc.is_paused():
-            return
-        await _play_next_locked(ctx)
-
-
-async def _play_next_locked(ctx):
-    gid = ctx.guild.id
-    player = players.get(gid)
-
-    mode = player.loop_mode
-    prev = player.current
-    if prev:
-        if mode == "song":
-            player.enqueue_front(prev["url"], prev["title"])
-        elif mode == "queue":
-            player.enqueue(prev["url"], prev["title"])
-
-    queue = player.queue
-    player.cleanup_audio_file()
-
-    if not queue:
-        if await radio_next(ctx):
-            return await _play_next_locked(ctx)
-        player.current = None
-        if ctx.voice_client:
-            await ctx.voice_client.disconnect()
-        return
-
-    track = queue.pop(0)
-    queued_title = track.title
-    url = normalize_youtube_url(track.url)
-
-    try:
-        info, audio_path, _ = await download_audio_with_fallback(gid, url)
-
-        song = {
-            "title": info.get("title", queued_title),
-            "url": url,
-            "thumbnail": info.get("thumbnail"),
-            "duration": info.get("duration"),
-            "uploader": info.get("uploader") or info.get("channel"),
-        }
-        player.current = song
-        player.last_video_id = info.get("id")
-        player.audio_file = audio_path
-
-        async with player.voice_lock:
-            if not ctx.voice_client or not ctx.voice_client.is_connected():
-                player.cleanup_audio_file()
-                return
-
-            source = discord.FFmpegPCMAudio(audio_path, options="-vn")
-            ctx.voice_client.play(
-                source,
-                after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop),
-            )
-
-        await ctx.send(embed=make_song_embed(song))
-        player.fail_count = 0
-
-    except Exception as e:
-        # Otra invocacion ya esta reproduciendo: abortar sin contar como fallo ni reintentar.
-        if isinstance(e, discord.ClientException) and "already playing" in str(e).lower():
-            return
-
-        player.fail_count += 1
-        traceback.print_exc()
-        print(f"Play error: {e}")
-
-        if player.fail_count == 1:
-            await ctx.send(f"❌ Error al reproducir: {e}")
-
-        if is_youtube_login_block(e):
-            await ctx.send(f"⚠️ `{queued_title}` bloqueado por YouTube desde este servidor. Saltando.")
-            player.fail_count = 0
-            await _play_next_locked(ctx)
-            return
-
-        if player.fail_count >= MAX_PLAYNEXT_FAILS:
-            await ctx.send("❌ Falló la reproducción varias veces. Deteniendo y limpiando cola.")
-            player.queue = []
-            async with player.voice_lock:
-                if ctx.voice_client and ctx.voice_client.is_connected():
-                    await ctx.voice_client.disconnect()
-            return
-
-        await _play_next_locked(ctx)
+def get_music_service(guild_id: int) -> MusicService:
+    service = music_services.get(guild_id)
+    if service is None:
+        player = players.get(guild_id)
+        service = MusicService(
+            player=player,
+            voice=DiscordVoiceGateway(bot, guild_id),
+            notifier=ChannelNotifier(player),
+            extractor=extractor,
+            audio_source_factory=ffmpeg_audio_source,
+            loop=bot.playback_loop,
+        )
+        music_services[guild_id] = service
+    return service
 
 
 # ──────────────────── COMANDOS ────────────────────
@@ -207,24 +127,22 @@ async def send_quietly(ctx, message: str) -> None:
         pass
 
 
+CONNECT_FAILURE_MESSAGES = {
+    ConnectResult.TIMEOUT: "❌ No pude conectarme al canal de voz (timeout). Verifica que el bot tenga permisos y que no haya un firewall bloqueando UDP.",
+    ConnectResult.REFUSED: "❌ No pude conectarme al canal de voz (permisos/capacidad).",
+}
+
+
 async def connect_to_author_voice(ctx) -> bool:
     if not ctx.author.voice:
         await ctx.send("❌ Debes estar en un canal de voz.")
         return False
 
-    async with players.get(ctx.guild.id).voice_lock:
-        if not ctx.voice_client or not ctx.voice_client.is_connected():
-            try:
-                await ctx.author.voice.channel.connect(timeout=60)
-            except asyncio.TimeoutError:
-                await send_quietly(ctx, "❌ No pude conectarme al canal de voz (timeout). Verifica que el bot tenga permisos y que no haya un firewall bloqueando UDP.")
-                return False
-            except (discord.Forbidden, discord.HTTPException, discord.ClientException) as e:
-                print(f"Voice connect error: {e}")
-                await send_quietly(ctx, "❌ No pude conectarme al canal de voz (permisos/capacidad).")
-                return False
-
-    players.get(ctx.guild.id).text_channel = ctx.channel
+    result = await get_music_service(ctx.guild.id).connect(ctx.author.voice.channel, ctx.channel)
+    failure_message = CONNECT_FAILURE_MESSAGES.get(result)
+    if failure_message:
+        await send_quietly(ctx, failure_message)
+        return False
     return True
 
 
@@ -237,32 +155,14 @@ async def play(ctx, *, search: str = None):
 
     await ctx.send(f"🔍 Buscando: **{search}**...")
 
+    service = get_music_service(ctx.guild.id)
     try:
-        info = await ytdlp_extract(search, is_search=True)
-        entries = info.get("entries") if isinstance(info, dict) else None
-        if not entries:
+        result = await service.search_and_enqueue(search)
+        if result is None:
             return await ctx.send("❌ No se encontraron resultados.")
-
-        video = entries[0]
-        url = normalize_youtube_url(video.get("webpage_url") or video.get("url"))
-        title = video.get("title", "Canción")
-
-        player = players.get(ctx.guild.id)
-        player.enqueue(url, title)
-
-        vc = ctx.voice_client
-        # "ocupado" = sonando, pausado, o con una cancion cargando (lock tomado)
-        busy = bool(vc and (vc.is_playing() or vc.is_paused())) or player.playback_lock.locked()
-        if busy:
-            song_preview = {
-                "title": title,
-                "url": url,
-                "thumbnail": video.get("thumbnail"),
-                "duration": video.get("duration"),
-                "uploader": video.get("uploader") or video.get("channel"),
-            }
-            await ctx.send(embed=make_song_embed(song_preview, in_queue=True))
-        await ensure_playing(ctx)
+        if result.busy:
+            await ctx.send(embed=make_song_embed(result.preview, in_queue=True))
+        await service.ensure_playing()
 
     except Exception as e:
         traceback.print_exc()
@@ -277,8 +177,7 @@ async def play(ctx, *, search: str = None):
 
 @bot.command()
 async def skip(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
+    if get_music_service(ctx.guild.id).skip():
         await ctx.send("⏭️ Canción saltada.")
     else:
         await ctx.send("❌ No hay nada reproduciéndose.")
@@ -286,20 +185,13 @@ async def skip(ctx):
 
 @bot.command()
 async def stop(ctx):
-    player = players.get(ctx.guild.id)
-    player.reset_session()
-    async with player.voice_lock:
-        if ctx.voice_client:
-            ctx.voice_client.stop()
-            if ctx.voice_client.is_connected():
-                await ctx.voice_client.disconnect()
+    await get_music_service(ctx.guild.id).stop()
     await ctx.send("⏹️ Reproducción detenida.")
 
 
 @bot.command()
 async def pause(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.pause()
+    if get_music_service(ctx.guild.id).pause():
         await ctx.send("⏸️ Pausado.")
     else:
         await ctx.send("❌ No hay nada reproduciéndose.")
@@ -307,8 +199,7 @@ async def pause(ctx):
 
 @bot.command()
 async def resume(ctx):
-    if ctx.voice_client and ctx.voice_client.is_paused():
-        ctx.voice_client.resume()
+    if get_music_service(ctx.guild.id).resume():
         await ctx.send("▶️ Reanudado.")
     else:
         await ctx.send("❌ No hay nada pausado.")
@@ -377,19 +268,17 @@ async def lyrics(ctx, *, song: str = None):
 
 @bot.command()
 async def radio(ctx, *, query: str = None):
-    gid = ctx.guild.id
-    radio_state = players.get(gid).radio
+    service = get_music_service(ctx.guild.id)
 
     if not query or query.lower() == "off":
-        radio_state.clear()
+        service.stop_radio()
         await ctx.send("📻 Radio desactivada.")
         return
 
     if not await connect_to_author_voice(ctx):
         return
 
-    radio_state.query = query
-    radio_state.reset_pool()
+    service.start_radio(query)
 
     embed = discord.Embed(
         title="📻 Radio activada",
@@ -398,10 +287,10 @@ async def radio(ctx, *, query: str = None):
     )
     await ctx.send(embed=embed)
 
-    if await radio_next(ctx):
-        await ensure_playing(ctx)
+    if await service.radio_next():
+        await service.ensure_playing()
     else:
-        radio_state.query = None
+        service.stop_radio()
         await ctx.send("❌ No se encontraron canciones para ese estilo.")
 
 
@@ -413,6 +302,7 @@ async def dj(ctx, *, request: str = None):
         return
 
     gid = ctx.guild.id
+    service = get_music_service(gid)
     await ctx.send("🤔 Pensando...")
 
     plan = await ai_dj.plan_playlist(request, DJ_MAX_SONGS, DJ_DEFAULT_MAX_DURATION_S)
@@ -436,7 +326,7 @@ async def dj(ctx, *, request: str = None):
         if not ctx.voice_client or not ctx.voice_client.is_connected():
             break
         try:
-            entries = await radio_engine.search_entries(ytdlp_extract, suggestion, search_count=3)
+            entries = await radio_engine.search_entries(service.extract_info, suggestion, search_count=3)
         except Exception as e:
             print(f"DJ error buscando '{suggestion}': {e}")
             skipped.append(suggestion)
@@ -451,7 +341,7 @@ async def dj(ctx, *, request: str = None):
         seen_ids.add(pick["id"])
         added.append(title)
         if len(added) == 1:
-            await ensure_playing(ctx)
+            await service.ensure_playing()
 
     if not added:
         return await ctx.send("❌ No encontré canciones que cumplan con el pedido.")
@@ -503,11 +393,7 @@ async def repo(ctx):
 
 @bot.command()
 async def loop(ctx):
-    player = players.get(ctx.guild.id)
-    modes = ["off", "song", "queue"]
-    current = player.loop_mode
-    next_mode = modes[(modes.index(current) + 1) % len(modes)]
-    player.loop_mode = next_mode
+    next_mode = get_music_service(ctx.guild.id).cycle_loop()
     labels = {
         "off":   "➡️ Loop **desactivado**.",
         "song":  "🔂 Repitiendo **canción actual**.",
@@ -849,7 +735,7 @@ async def pl_load(ctx, *, nombre: str = None):
     for entry in songs:
         players.get(ctx.guild.id).enqueue(entry["url"], entry["title"])
     await ctx.send(f"📋 **{nombre}** cargada — {len(songs)} canciones añadidas a la cola.")
-    await ensure_playing(ctx)
+    await get_music_service(ctx.guild.id).ensure_playing()
 
 
 @playlist.command(name="list")
@@ -925,44 +811,9 @@ async def reiniciar(ctx):
     os._exit(0)
 
 
-ALONE_TIMEOUT = 180  # segundos hasta desconectarse si el canal queda vacio
-
-
-async def _alone_timeout(vc: discord.VoiceClient, gid: int) -> None:
-    await asyncio.sleep(ALONE_TIMEOUT)
-    if not vc.is_connected():
-        return
-    if any(not m.bot for m in vc.channel.members):
-        return
-    player = players.get(gid)
-    player.reset_session()
-    player.alone_task = None
-    async with player.voice_lock:
-        if vc.is_connected():
-            await vc.disconnect()
-    ch = player.text_channel
-    if ch:
-        try:
-            await ch.send("👋 Me fui porque quedé solo en el canal.")
-        except Exception:
-            pass
-
-
 @bot.event
 async def on_voice_state_update(member, before, after):
-    for vc in bot.voice_clients:
-        if vc.guild != member.guild or not vc.is_connected():
-            continue
-        gid = vc.guild.id
-        player = players.get(gid)
-        humans = [m for m in vc.channel.members if not m.bot]
-        if not humans:
-            if player.alone_task is None or player.alone_task.done():
-                player.alone_task = asyncio.create_task(_alone_timeout(vc, gid))
-        else:
-            task, player.alone_task = player.alone_task, None
-            if task and not task.done():
-                task.cancel()
+    get_music_service(member.guild.id).refresh_alone_watch()
 
 
 @bot.event

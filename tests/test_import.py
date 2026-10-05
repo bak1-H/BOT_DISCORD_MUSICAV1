@@ -42,7 +42,7 @@ def test_import_does_not_start_the_bot():
         """
     )
     assert result.returncode == 0, result.stderr
-    assert "imported Bot" in result.stdout
+    assert "imported MusicBot" in result.stdout
 
 
 def test_running_as_main_starts_the_bot_with_discord_token():
