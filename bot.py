@@ -1269,4 +1269,5 @@ async def on_ready():
     print(f"[OK] {bot.user} listo.")
 
 
-bot.run(os.getenv("DISCORD_TOKEN"))
+if __name__ == "__main__":
+    bot.run(os.getenv("DISCORD_TOKEN"))
