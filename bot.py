@@ -63,9 +63,12 @@ class MusicBot(commands.Bot):
     def __init__(self, **options):
         super().__init__(**options)
         self.playback_loop = None
+        self.agent_listener = None
 
     async def setup_hook(self):
         self.playback_loop = asyncio.get_running_loop()
+        if self.agent_listener is None:
+            self.agent_listener = install_agent()
 
 
 bot = MusicBot(command_prefix="!", intents=intents, case_insensitive=True, help_command=None)
@@ -600,6 +603,33 @@ async def reiniciar(ctx):
     await bot.close()
     # Salida limpia: en el mini PC systemd lo reinicia automaticamente.
     os._exit(0)
+
+
+AGENT_DISABLED_VALUES = {"false", "0", "no", "off"}
+
+
+def agent_enabled(env=os.environ) -> bool:
+    return env.get("AGENT_ENABLED", "true").strip().lower() not in AGENT_DISABLED_VALUES
+
+
+def install_agent(env=os.environ):
+    if not agent_enabled(env):
+        print("[agente] deshabilitado por AGENT_ENABLED")
+        return None
+    try:
+        from agent.adapters import GeniusLyrics, RunContextFactory
+        from agent.listener import AgentListener
+        from agent.model import build_runner
+
+        runner = build_runner(env)
+        context_factory = RunContextFactory(get_music_service, lol_service, GeniusLyrics(), lambda: PLAYLISTS_DIR)
+        listener = AgentListener(runner, context_factory, bot)
+    except Exception as error:
+        print(f"[agente] deshabilitado: {type(error).__name__}: {error}")
+        return None
+    bot.add_listener(listener.on_message, "on_message")
+    print("[agente] activo")
+    return listener
 
 
 @bot.event
