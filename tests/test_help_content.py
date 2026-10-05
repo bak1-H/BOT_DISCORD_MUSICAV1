@@ -61,3 +61,28 @@ def test_module_has_no_third_party_or_discord_dependency():
         if isinstance(node, (ast.Import, ast.ImportFrom)) and getattr(node, "names", None)
     }
     assert imported <= {"__future__"}
+
+
+async def test_ayuda_command_sends_one_embed_built_from_the_help_content(isolated_bot):
+    from tests.fakes import FakeContext
+
+    ctx = FakeContext()
+
+    await isolated_bot.ayuda.callback(ctx)
+
+    embed = ctx.notifier.messages[0]["embed"]
+    assert embed.title == help_content.HELP_TITLE
+    assert [field.name for field in embed.fields][: len(help_content.HELP_SECTIONS)] == [
+        title for title, _ in help_content.HELP_SECTIONS
+    ]
+    assert [field.value for field in embed.fields][: len(help_content.HELP_SECTIONS)] == [
+        body for _, body in help_content.HELP_SECTIONS
+    ]
+    assert all(command in embed.fields[-1].value for command in help_content.FALLBACK_COMMANDS)
+    assert all(len(field.value) <= 1024 for field in embed.fields)
+
+
+def test_ayuda_and_comandos_are_both_registered(isolated_bot):
+    names = {command.name for command in isolated_bot.bot.commands}
+
+    assert {"ayuda", "comandos"} <= names

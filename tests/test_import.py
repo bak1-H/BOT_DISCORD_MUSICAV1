@@ -64,7 +64,7 @@ def test_running_as_main_starts_the_bot_with_discord_token():
 def test_import_exposes_the_registered_commands(isolated_bot):
     expected = {
         "play", "skip", "stop", "pause", "resume", "queue", "np", "lyrics",
-        "radio", "dj", "comandos", "repo", "loop", "clear", "invocador", "vs",
+        "radio", "dj", "comandos", "ayuda", "repo", "loop", "clear", "invocador", "vs",
         "playlist", "reiniciar",
     }
     assert expected <= {command.name for command in isolated_bot.bot.commands}

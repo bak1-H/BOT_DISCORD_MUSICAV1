@@ -12,7 +12,7 @@ from agent.memory import ConversationMemory
 from agent.prompt import build_system_prompt, build_turn_prompt
 from agent.tools import ToolRegistry
 
-TURN_TIMEOUT_S = 45
+TURN_TIMEOUT_S = 75
 MAX_REPLY_CHARS = 1900
 DEFAULT_REPLY = "Listo."
 ROLE_MESSAGES = {"user": HumanMessage, "assistant": AIMessage}

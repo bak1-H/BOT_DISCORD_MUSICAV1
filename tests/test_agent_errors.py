@@ -82,3 +82,30 @@ def test_chat_model_accepts_documented_parameter_names():
     assert model.max_retries == 1
     assert model.temperature == 0.2
     assert model.model.endswith("gemini-3.5-flash-lite")
+
+
+def test_real_wrapper_504_deadline_exceeded_is_timeout():
+    original = ServerError(504, {"error": {"code": 504, "status": "DEADLINE_EXCEEDED", "message": "Deadline expired"}})
+    wrapped = raised_by_wrapper(_handle_server_error, original)
+
+    assert classify_error(wrapped) is ErrorKind.TIMEOUT
+
+
+def test_bare_server_error_504_is_timeout():
+    assert classify_error(ServerError(504, {"error": {"message": "gateway"}})) is ErrorKind.TIMEOUT
+
+
+def test_deadline_exceeded_in_the_message_of_a_wrapped_cause_is_timeout():
+    try:
+        try:
+            raise RuntimeError("504 DEADLINE_EXCEEDED. Deadline expired before operation could complete")
+        except RuntimeError as inner:
+            raise ValueError("wrapper") from inner
+    except ValueError as outer:
+        assert classify_error(outer) is ErrorKind.TIMEOUT
+
+
+def test_other_server_errors_stay_unavailable():
+    for status in (500, 502, 503):
+        original = ServerError(status, {"error": {"message": "overloaded"}})
+        assert classify_error(raised_by_wrapper(_handle_server_error, original)) is ErrorKind.UNAVAILABLE

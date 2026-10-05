@@ -8,6 +8,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import base64
 import ai_dj
+import help_content
 from lol.embeds import build_comparison_embed, build_summoner_embed
 from lol.riot import RiotApi, RiotLookupError
 from lol.service import LolService
@@ -391,6 +392,19 @@ async def comandos(ctx):
     await ctx.send(embed=embed)
 
 
+def build_help_embed():
+    embed = discord.Embed(title=help_content.HELP_TITLE, color=discord.Color.blurple())
+    for title, body in help_content.HELP_SECTIONS:
+        embed.add_field(name=title, value=body, inline=False)
+    embed.add_field(name="Comandos sin IA", value=", ".join(help_content.FALLBACK_COMMANDS), inline=False)
+    return embed
+
+
+@bot.command()
+async def ayuda(ctx):
+    await ctx.send(embed=build_help_embed())
+
+
 @bot.command()
 async def repo(ctx):
     await ctx.send("🔗 Repositorio: https://github.com/bak1-H/BOT_DISCORD_MUSICA")
@@ -629,7 +643,7 @@ def install_agent(env=os.environ):
         context_factory = RunContextFactory(get_music_service, lol_service, GeniusLyrics(), lambda: PLAYLISTS_DIR)
         listener = AgentListener(runner, context_factory, bot)
     except Exception as error:
-        print(f"[agente] deshabilitado: {type(error).__name__}: {error}")
+        print(f"[agente] deshabilitado: {type(error).__name__}")
         return None
     bot.add_listener(listener.on_message, "on_message")
     print("[agente] activo")

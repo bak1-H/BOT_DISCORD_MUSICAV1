@@ -5,6 +5,8 @@ import httpx
 from langchain_core.exceptions import ModelAPIError, ModelConnectionError, ModelRateLimitError, ModelTimeoutError
 
 RATE_LIMIT_STATUS = 429
+GATEWAY_TIMEOUT_STATUS = 504
+DEADLINE_MARKER = "DEADLINE_EXCEEDED"
 SERVER_ERROR_FROM = 500
 MAX_CAUSE_DEPTH = 8
 
@@ -49,6 +51,10 @@ def _status_of(error: BaseException) -> int | None:
     return None
 
 
+def _is_deadline_exceeded(error: BaseException) -> bool:
+    return _status_of(error) == GATEWAY_TIMEOUT_STATUS or DEADLINE_MARKER in str(error).upper()
+
+
 def _classify_single(error: BaseException) -> ErrorKind | None:
     if isinstance(error, ModelRateLimitError) or _status_of(error) == RATE_LIMIT_STATUS:
         return ErrorKind.RATE_LIMIT
@@ -63,7 +69,10 @@ def _classify_single(error: BaseException) -> ErrorKind | None:
 
 
 def classify_error(error: BaseException) -> ErrorKind:
-    for cause in _causes(error):
+    chain = list(_causes(error))
+    if any(_is_deadline_exceeded(cause) for cause in chain):
+        return ErrorKind.TIMEOUT
+    for cause in chain:
         kind = _classify_single(cause)
         if kind is not None:
             return kind

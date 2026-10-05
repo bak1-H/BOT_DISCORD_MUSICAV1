@@ -105,3 +105,15 @@ async def test_run_context_is_wired_with_lol_lyrics_playlists_and_guild_music(is
     assert ctx.playlists._playlists_dir == isolated_bot.PLAYLISTS_DIR
     assert ctx.music is isolated_bot.get_music_service(GID)
     assert ctx.voice_channel is message.author.voice.channel
+
+
+def test_agent_startup_failure_log_prints_only_the_exception_type(isolated_bot, monkeypatch, agent_env, capsys):
+    def explode(env):
+        raise RuntimeError("secret-api-key-123")
+
+    monkeypatch.setattr("agent.model.build_runner", explode)
+
+    assert isolated_bot.install_agent(agent_env) is None
+    printed = capsys.readouterr().out
+    assert "RuntimeError" in printed
+    assert "secret-api-key-123" not in printed
