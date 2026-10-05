@@ -4,4 +4,7 @@ python-dotenv
 lyricsgenius
 yt-dlp[default]
 davey
-google-genai
+google-genai>=2.20,<3
+aiohttp
+langgraph==1.2.12
+langchain-google-genai==4.4.0
