@@ -1,20 +1,25 @@
 import os
 import asyncio
-import random
 import re
-import copy
 import traceback
-import json
 from datetime import datetime, timezone, timedelta
-from collections import deque
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 import base64
-import yt_dlp
-import lyricsgenius
-import aiohttp
 import ai_dj
+from lol.embeds import build_comparison_embed, build_summoner_embed
+from lol.riot import RiotApi, RiotLookupError
+from lol.service import LolService
+from music import playlists as playlist_store, radio as radio_engine
+from music.discord_adapters import ChannelNotifier, DiscordVoiceGateway, ffmpeg_audio_source
+from music.embeds import format_duration, make_song_embed
+from music.extractor import YtdlpExtractor
+from music.lyrics import clean_title_for_lyrics, get_genius
+from music.player import PlayerRegistry
+from music.ports import ConnectResult
+from music.service import MusicService
+from music.ytdl import YtdlpSettings, is_youtube_login_block
 
 load_dotenv()
 
@@ -49,17 +54,24 @@ if not COOKIES_FILE:
         COOKIES_FILE = _bundled
         print(f"[cookies] Usando archivo bundled")
 
-# ──────────────────── GENIUS ────────────────────
-genius = lyricsgenius.Genius(
-    os.getenv("GENIUS_TOKEN"),
-    skip_non_songs=True,
-    remove_section_headers=True,
-)
-
 # ──────────────────── DISCORD ────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents, case_insensitive=True)
+
+
+class MusicBot(commands.Bot):
+    def __init__(self, **options):
+        super().__init__(**options)
+        self.playback_loop = None
+        self.agent_listener = None
+
+    async def setup_hook(self):
+        self.playback_loop = asyncio.get_running_loop()
+        if self.agent_listener is None:
+            self.agent_listener = install_agent()
+
+
+bot = MusicBot(command_prefix="!", intents=intents, case_insensitive=True, help_command=None)
 
 # ──────────────────── CONFIG ────────────────────
 YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip() or None
@@ -69,411 +81,46 @@ RIOT_ROUTING = "americas"                          # LAS/LAN/NA usan americas
 MAX_PLAYNEXT_FAILS = 3
 PO_TOKEN = os.getenv("YOUTUBE_PO_TOKEN", "").strip()
 VISITOR_DATA = os.getenv("YOUTUBE_VISITOR_DATA", "").strip()
-# android_vr no requiere po_token y suele exponer pistas de audio puro (webm/opus)
-# en videos donde web/android/ios sólo entregan el combinado legado mp4 360p
-# (formato 18, sin variante audio-only) -> el selector "-f bestaudio" falla ahí.
-YT_CLIENTS = ["web", "android_vr", "android", "ios"]
-RADIO_MAX_DURATION_S = 600
-RADIO_HISTORY_SIZE = 10
-RADIO_BATCH_SIZE = 5
 DJ_MAX_SONGS = 15
 DJ_DEFAULT_MAX_DURATION_S = 600
 DJ_DURATION_CAP_S = 1800
 
-# ──────────────────── YT-DLP BASE CONFIG ────────────────────
-_YTDLP_BASE = {
-    "format": "bestaudio*/best*",
-    "noplaylist": True,
-    "nocheckcertificate": True,
-    "quiet": True,
-    "no_warnings": True,
-    "proxy": YTDLP_PROXY,
-    "js_runtimes": {"node": {}},
-    "cookiefile": COOKIES_FILE,
-}
+YTDLP_SETTINGS = YtdlpSettings(
+    proxy=YTDLP_PROXY,
+    cookies_file=COOKIES_FILE,
+    po_token=PO_TOKEN,
+    visitor_data=VISITOR_DATA,
+)
 
 # ──────────────────── STATE ────────────────────
-# queues[gid]: list of (url, title)
-queues: dict[int, list[tuple[str, str]]] = {}
-# current_song[gid]: {"title", "url", "thumbnail", "duration", "uploader"}
-current_song: dict[int, dict] = {}
-radio_query: dict[int, str | None] = {}       # contexto activo por servidor
-radio_played: dict[int, set[str]] = {}         # IDs reproducidos para no repetir
-radio_history: dict[int, deque[str]] = {}
-radio_suggestions: dict[int, list[str]] = {}
-last_video_id: dict[int, str] = {}
-playnext_fail_count: dict[int, int] = {}
-voice_state_locks: dict[int, asyncio.Lock] = {}
-current_audio_file: dict[int, str] = {}  # gid -> archivo temporal de la cancion actual
-loop_mode: dict[int, str] = {}  # "off" | "song" | "queue"
-alone_tasks: dict[int, asyncio.Task] = {}       # timer de desconexion por inactividad
-last_text_channel: dict[int, discord.TextChannel] = {}  # ultimo canal de texto usado
-
-
-def get_voice_lock(gid: int) -> asyncio.Lock:
-    lock = voice_state_locks.get(gid)
-    if lock is None:
-        lock = asyncio.Lock()
-        voice_state_locks[gid] = lock
-    return lock
-
-
-# Serializa el arranque de canciones por servidor: evita que dos invocaciones
-# de play_next (ej. encolar rapido mientras una cancion aun esta cargando)
-# reproduzcan a la vez y choquen con "Already playing audio".
-playback_locks: dict[int, asyncio.Lock] = {}
+players = PlayerRegistry()
 
 
 DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
-def cleanup_audio_file(gid: int) -> None:
-    path = current_audio_file.pop(gid, None)
-    if path and os.path.exists(path):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
-def get_playback_lock(gid: int) -> asyncio.Lock:
-    lock = playback_locks.get(gid)
-    if lock is None:
-        lock = asyncio.Lock()
-        playback_locks[gid] = lock
-    return lock
-
-# ──────────────────── HELPERS ────────────────────
-
-def format_duration(seconds) -> str:
-    if not seconds:
-        return "?"
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-
-def clean_title_for_lyrics(title: str) -> str:
-    if not title:
-        return ""
-    title = title.lower()
-    for p in [
-        r"\(.*?\)", r"\[.*?\]", r"official video", r"official audio",
-        r"lyrics?", r"audio", r"video", r"hd", r"4k",
-        r"remastered?", r"feat\.?.*", r"ft\.?.*", r"- topic", r"•.*",
-    ]:
-        title = re.sub(p, "", title)
-    title = re.sub(r"[^\w\s\-]", "", title)
-    return re.sub(r"\s{2,}", " ", title).strip()
-
-
-def normalize_youtube_url(value: str | None) -> str | None:
-    if not value:
-        return None
-    return value if value.startswith("http") else f"https://www.youtube.com/watch?v={value}"
-
-
-def build_ytdlp_opts(is_search: bool, client: str = "web", search_count: int = 1) -> dict:
-    opts = copy.deepcopy(_YTDLP_BASE)
-    yt_args: dict = {"player_client": [client]}
-    if PO_TOKEN:
-        yt_args["po_token"] = [f"{client}+{PO_TOKEN}"]
-    if VISITOR_DATA:
-        yt_args["visitor_data"] = [VISITOR_DATA]
-    opts["extractor_args"] = {"youtube": yt_args}
-    if is_search:
-        opts["default_search"] = f"ytsearch{search_count}"
-        opts["extract_flat"] = "in_playlist"
-    return opts
-
-
-def is_youtube_login_block(err: Exception) -> bool:
-    s = str(err).lower()
-    return any(phrase in s for phrase in (
-        "sign in to confirm you're not a bot",
-        "sign in to confirm",
-        "bot check",
-        "login required",
-    ))
-
-
-def make_song_embed(song: dict, in_queue: bool = False) -> discord.Embed:
-    if in_queue:
-        embed = discord.Embed(
-            title="✅ Añadido a la cola",
-            description=f"**{song['title']}**",
-            color=discord.Color.blue(),
-        )
-    else:
-        embed = discord.Embed(
-            title="🎵 Reproduciendo ahora",
-            description=f"**{song['title']}**",
-            color=discord.Color.green(),
-        )
-    if song.get("uploader"):
-        embed.add_field(name="Canal", value=song["uploader"], inline=True)
-    if song.get("duration"):
-        embed.add_field(name="Duración", value=format_duration(song["duration"]), inline=True)
-    if song.get("thumbnail"):
-        embed.set_thumbnail(url=song["thumbnail"])
-    return embed
-
-
 # ──────────────────── AUDIO EXTRACTION ────────────────────
 
-async def ytdlp_extract(query: str, is_search: bool = False, client: str = "web", search_count: int = 1) -> dict:
-    loop = asyncio.get_running_loop()
-    opts = build_ytdlp_opts(is_search, client, search_count)
+extractor = YtdlpExtractor(YTDLP_SETTINGS, DOWNLOAD_DIR)
 
-    def _extract():
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(query, download=False)
-
-    return await loop.run_in_executor(None, _extract)
+music_services = {}
 
 
-def build_download_opts(gid: int, client: str) -> dict:
-    opts = build_ytdlp_opts(is_search=False, client=client)
-    opts["format"] = "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/bestaudio/best"
-    opts["outtmpl"] = os.path.join(DOWNLOAD_DIR, f"{gid}_%(id)s.%(ext)s")
-    return opts
-
-
-async def download_audio_with_fallback(gid: int, url: str) -> tuple[dict, str, str]:
-    """Try each player_client until one can extract AND download the audio.
-
-    Extraction and download happen in the same yt-dlp call (single request per
-    client) instead of extracting metadata first and re-downloading separately
-    afterwards: doing two round-trips to YouTube for the same video is what was
-    triggering an intermittent 403 on the second (download) request.
-    """
-    loop = asyncio.get_running_loop()
-    last_error = None
-    for client in YT_CLIENTS:
-        opts = build_download_opts(gid, client)
-
-        def _download():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if isinstance(info, dict) and info.get("entries"):
-                    info = info["entries"][0]
-                return info, ydl.prepare_filename(info)
-
-        try:
-            info, path = await loop.run_in_executor(None, _download)
-            if os.path.exists(path):
-                return info, path, client
-        except Exception as e:
-            last_error = e
-    if last_error:
-        raise last_error
-    raise RuntimeError("No se pudo descargar el audio con ningún client")
-
-
-# ──────────────────── RADIO ────────────────────
-
-def reset_radio_state(gid: int) -> None:
-    radio_played[gid] = set()
-    radio_history[gid] = deque(maxlen=RADIO_HISTORY_SIZE)
-    radio_suggestions[gid] = []
-
-
-def clear_radio_state(gid: int) -> None:
-    radio_query.pop(gid, None)
-    radio_played.pop(gid, None)
-    radio_history.pop(gid, None)
-    radio_suggestions.pop(gid, None)
-
-
-def is_playable_candidate(entry: dict, max_duration_s: int, excluded_ids: set[str]) -> bool:
-    video_id = entry.get("id")
-    duration = entry.get("duration")
-    return (
-        bool(video_id)
-        and video_id not in excluded_ids
-        and entry.get("live_status") not in ("is_live", "is_upcoming")
-        and (duration is None or duration <= max_duration_s)
-    )
-
-
-def enqueue_entry(gid: int, entry: dict) -> str | None:
-    url = normalize_youtube_url(entry.get("webpage_url") or entry.get("url"))
-    if not url:
-        return None
-    title = entry.get("title", "Desconocido")
-    queues.setdefault(gid, []).append((url, title))
-    return title
-
-
-def is_radio_candidate(gid: int, entry: dict) -> bool:
-    excluded_ids = radio_played.get(gid, set()) | {last_video_id.get(gid)}
-    return is_playable_candidate(entry, RADIO_MAX_DURATION_S, excluded_ids)
-
-
-def enqueue_radio_pick(gid: int, pick: dict) -> bool:
-    title = enqueue_entry(gid, pick)
-    if title is None:
-        return False
-    radio_played.setdefault(gid, set()).add(pick["id"])
-    radio_history.setdefault(gid, deque(maxlen=RADIO_HISTORY_SIZE)).append(title)
-    return True
-
-
-async def search_entries(query: str, search_count: int) -> list[dict]:
-    info = await ytdlp_extract(query, is_search=True, search_count=search_count)
-    entries = info.get("entries") if isinstance(info, dict) else None
-    return [e for e in entries or [] if isinstance(e, dict)]
-
-
-async def radio_next_from_ai(gid: int, query: str) -> bool:
-    pending = radio_suggestions.setdefault(gid, [])
-    if not pending:
-        recent_titles = list(radio_history.get(gid, []))
-        pending.extend(await ai_dj.suggest_songs(query, recent_titles, RADIO_BATCH_SIZE))
-
-    while pending:
-        suggestion = pending.pop(0)
-        try:
-            entries = await search_entries(suggestion, search_count=3)
-        except Exception as e:
-            print(f"Radio IA error buscando '{suggestion}': {e}")
-            continue
-        pick = next((e for e in entries if is_radio_candidate(gid, e)), None)
-        if pick and enqueue_radio_pick(gid, pick):
-            return True
-    return False
-
-
-async def radio_next_from_search(gid: int, query: str) -> bool:
-    entries = await search_entries(query, search_count=5)
-    candidates = [e for e in entries if is_radio_candidate(gid, e)]
-    if not candidates:
-        radio_played[gid] = set()
-        candidates = [e for e in entries if is_radio_candidate(gid, e)]
-    if not candidates:
-        return False
-    return enqueue_radio_pick(gid, random.choice(candidates))
-
-
-async def radio_next(ctx) -> bool:
-    gid = ctx.guild.id
-    query = radio_query.get(gid)
-    if not query:
-        return False
-
-    try:
-        if await radio_next_from_ai(gid, query):
-            return True
-        return await radio_next_from_search(gid, query)
-    except Exception as e:
-        print(f"Radio error: {e}")
-        return False
-
-
-# ──────────────────── PLAY NEXT ────────────────────
-
-async def play_next(ctx):
-    """Serializa el arranque de la siguiente cancion. Lo llama el callback `after`."""
-    async with get_playback_lock(ctx.guild.id):
-        await _play_next_locked(ctx)
-
-
-async def ensure_playing(ctx):
-    """Arranca la reproduccion solo si no hay nada sonando ni cargando (serializado)."""
-    gid = ctx.guild.id
-    async with get_playback_lock(gid):
-        vc = ctx.voice_client
-        if not vc or not vc.is_connected():
-            return
-        if vc.is_playing() or vc.is_paused():
-            return
-        await _play_next_locked(ctx)
-
-
-async def _play_next_locked(ctx):
-    gid = ctx.guild.id
-    playnext_fail_count.setdefault(gid, 0)
-
-    mode = loop_mode.get(gid, "off")
-    prev = current_song.get(gid)
-    if prev:
-        if mode == "song":
-            queues.setdefault(gid, []).insert(0, (prev["url"], prev["title"]))
-        elif mode == "queue":
-            queues.setdefault(gid, []).append((prev["url"], prev["title"]))
-
-    queue = queues.get(gid) or []
-    cleanup_audio_file(gid)  # ya no se necesita el archivo de la cancion que termino
-
-    if not queue:
-        if await radio_next(ctx):
-            return await _play_next_locked(ctx)
-        current_song.pop(gid, None)
-        if ctx.voice_client:
-            await ctx.voice_client.disconnect()
-        return
-
-    url_raw, queued_title = queue.pop(0)
-    queues[gid] = queue
-    url = normalize_youtube_url(url_raw)
-
-    try:
-        info, audio_path, _ = await download_audio_with_fallback(gid, url)
-
-        song = {
-            "title": info.get("title", queued_title),
-            "url": url,
-            "thumbnail": info.get("thumbnail"),
-            "duration": info.get("duration"),
-            "uploader": info.get("uploader") or info.get("channel"),
-        }
-        current_song[gid] = song
-        last_video_id[gid] = info.get("id")
-        current_audio_file[gid] = audio_path
-
-        async with get_voice_lock(gid):
-            if not ctx.voice_client or not ctx.voice_client.is_connected():
-                cleanup_audio_file(gid)
-                return
-
-            source = discord.FFmpegPCMAudio(audio_path, options="-vn")
-            ctx.voice_client.play(
-                source,
-                after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop),
-            )
-
-        await ctx.send(embed=make_song_embed(song))
-        playnext_fail_count[gid] = 0
-
-    except Exception as e:
-        # Otra invocacion ya esta reproduciendo: abortar sin contar como fallo ni reintentar.
-        if isinstance(e, discord.ClientException) and "already playing" in str(e).lower():
-            return
-
-        playnext_fail_count[gid] = playnext_fail_count.get(gid, 0) + 1
-        traceback.print_exc()
-        print(f"Play error: {e}")
-
-        if playnext_fail_count[gid] == 1:
-            await ctx.send(f"❌ Error al reproducir: {e}")
-
-        if is_youtube_login_block(e):
-            await ctx.send(f"⚠️ `{queued_title}` bloqueado por YouTube desde este servidor. Saltando.")
-            playnext_fail_count[gid] = 0
-            await _play_next_locked(ctx)
-            return
-
-        if playnext_fail_count[gid] >= MAX_PLAYNEXT_FAILS:
-            await ctx.send("❌ Falló la reproducción varias veces. Deteniendo y limpiando cola.")
-            queues[gid] = []
-            async with get_voice_lock(gid):
-                if ctx.voice_client and ctx.voice_client.is_connected():
-                    await ctx.voice_client.disconnect()
-            return
-
-        await _play_next_locked(ctx)
+def get_music_service(guild_id: int) -> MusicService:
+    service = music_services.get(guild_id)
+    if service is None:
+        player = players.get(guild_id)
+        service = MusicService(
+            player=player,
+            voice=DiscordVoiceGateway(bot, guild_id),
+            notifier=ChannelNotifier(player),
+            extractor=extractor,
+            audio_source_factory=ffmpeg_audio_source,
+            loop=bot.playback_loop,
+        )
+        music_services[guild_id] = service
+    return service
 
 
 # ──────────────────── COMANDOS ────────────────────
@@ -485,24 +132,22 @@ async def send_quietly(ctx, message: str) -> None:
         pass
 
 
+CONNECT_FAILURE_MESSAGES = {
+    ConnectResult.TIMEOUT: "❌ No pude conectarme al canal de voz (timeout). Verifica que el bot tenga permisos y que no haya un firewall bloqueando UDP.",
+    ConnectResult.REFUSED: "❌ No pude conectarme al canal de voz (permisos/capacidad).",
+}
+
+
 async def connect_to_author_voice(ctx) -> bool:
     if not ctx.author.voice:
         await ctx.send("❌ Debes estar en un canal de voz.")
         return False
 
-    async with get_voice_lock(ctx.guild.id):
-        if not ctx.voice_client or not ctx.voice_client.is_connected():
-            try:
-                await ctx.author.voice.channel.connect(timeout=60)
-            except asyncio.TimeoutError:
-                await send_quietly(ctx, "❌ No pude conectarme al canal de voz (timeout). Verifica que el bot tenga permisos y que no haya un firewall bloqueando UDP.")
-                return False
-            except (discord.Forbidden, discord.HTTPException, discord.ClientException) as e:
-                print(f"Voice connect error: {e}")
-                await send_quietly(ctx, "❌ No pude conectarme al canal de voz (permisos/capacidad).")
-                return False
-
-    last_text_channel[ctx.guild.id] = ctx.channel
+    result = await get_music_service(ctx.guild.id).connect(ctx.author.voice.channel, ctx.channel)
+    failure_message = CONNECT_FAILURE_MESSAGES.get(result)
+    if failure_message:
+        await send_quietly(ctx, failure_message)
+        return False
     return True
 
 
@@ -515,31 +160,14 @@ async def play(ctx, *, search: str = None):
 
     await ctx.send(f"🔍 Buscando: **{search}**...")
 
+    service = get_music_service(ctx.guild.id)
     try:
-        info = await ytdlp_extract(search, is_search=True)
-        entries = info.get("entries") if isinstance(info, dict) else None
-        if not entries:
+        result = await service.search_and_enqueue(search)
+        if result is None:
             return await ctx.send("❌ No se encontraron resultados.")
-
-        video = entries[0]
-        url = normalize_youtube_url(video.get("webpage_url") or video.get("url"))
-        title = video.get("title", "Canción")
-
-        queues.setdefault(ctx.guild.id, []).append((url, title))
-
-        vc = ctx.voice_client
-        # "ocupado" = sonando, pausado, o con una cancion cargando (lock tomado)
-        busy = bool(vc and (vc.is_playing() or vc.is_paused())) or get_playback_lock(ctx.guild.id).locked()
-        if busy:
-            song_preview = {
-                "title": title,
-                "url": url,
-                "thumbnail": video.get("thumbnail"),
-                "duration": video.get("duration"),
-                "uploader": video.get("uploader") or video.get("channel"),
-            }
-            await ctx.send(embed=make_song_embed(song_preview, in_queue=True))
-        await ensure_playing(ctx)
+        if result.busy:
+            await ctx.send(embed=make_song_embed(result.preview, in_queue=True))
+        await service.ensure_playing()
 
     except Exception as e:
         traceback.print_exc()
@@ -554,8 +182,7 @@ async def play(ctx, *, search: str = None):
 
 @bot.command()
 async def skip(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
+    if get_music_service(ctx.guild.id).skip():
         await ctx.send("⏭️ Canción saltada.")
     else:
         await ctx.send("❌ No hay nada reproduciéndose.")
@@ -563,24 +190,13 @@ async def skip(ctx):
 
 @bot.command()
 async def stop(ctx):
-    gid = ctx.guild.id
-    cleanup_audio_file(gid)
-    queues[gid] = []
-    current_song.pop(gid, None)
-    loop_mode.pop(gid, None)
-    clear_radio_state(gid)
-    async with get_voice_lock(gid):
-        if ctx.voice_client:
-            ctx.voice_client.stop()
-            if ctx.voice_client.is_connected():
-                await ctx.voice_client.disconnect()
+    await get_music_service(ctx.guild.id).stop()
     await ctx.send("⏹️ Reproducción detenida.")
 
 
 @bot.command()
 async def pause(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.pause()
+    if get_music_service(ctx.guild.id).pause():
         await ctx.send("⏸️ Pausado.")
     else:
         await ctx.send("❌ No hay nada reproduciéndose.")
@@ -588,8 +204,7 @@ async def pause(ctx):
 
 @bot.command()
 async def resume(ctx):
-    if ctx.voice_client and ctx.voice_client.is_paused():
-        ctx.voice_client.resume()
+    if get_music_service(ctx.guild.id).resume():
         await ctx.send("▶️ Reanudado.")
     else:
         await ctx.send("❌ No hay nada pausado.")
@@ -597,9 +212,9 @@ async def resume(ctx):
 
 @bot.command(aliases=["q"])
 async def queue(ctx):
-    gid = ctx.guild.id
-    q = queues.get(gid) or []
-    song = current_song.get(gid)
+    player = players.get(ctx.guild.id)
+    q = player.queue
+    song = player.current
 
     embed = discord.Embed(title="🎵 Cola de reproducción", color=discord.Color.blurple())
 
@@ -611,14 +226,14 @@ async def queue(ctx):
             inline=False,
         )
     if q:
-        lines = [f"`{i + 1}.` {title}" for i, (_, title) in enumerate(q[:10])]
+        lines = [f"`{i + 1}.` {track.title}" for i, track in enumerate(q[:10])]
         if len(q) > 10:
             lines.append(f"*...y {len(q) - 10} más*")
         embed.add_field(name="📋 En cola", value="\n".join(lines), inline=False)
     elif not song:
         embed.description = "La cola está vacía."
 
-    rq = radio_query.get(gid)
+    rq = player.radio.query
     if rq:
         embed.set_footer(text=f"📻 Radio activa: {rq}")
 
@@ -627,7 +242,7 @@ async def queue(ctx):
 
 @bot.command(aliases=["nowplaying"])
 async def np(ctx):
-    song = current_song.get(ctx.guild.id)
+    song = players.get(ctx.guild.id).current
     if not song:
         return await ctx.send("❌ No hay nada reproduciéndose ahora.")
     await ctx.send(embed=make_song_embed(song))
@@ -636,7 +251,7 @@ async def np(ctx):
 @bot.command()
 async def lyrics(ctx, *, song: str = None):
     if not song:
-        song_data = current_song.get(ctx.guild.id)
+        song_data = players.get(ctx.guild.id).current
         song = song_data["title"] if song_data else None
     if not song:
         return await ctx.send("❌ Escribe el nombre de la canción o reproduce una primero.")
@@ -644,7 +259,7 @@ async def lyrics(ctx, *, song: str = None):
     title = clean_title_for_lyrics(song)
     try:
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, lambda: genius.search_song(title))
+        result = await loop.run_in_executor(None, lambda: get_genius().search_song(title))
         if not result or not result.lyrics:
             return await ctx.send("❌ Letra no encontrada.")
         text = result.lyrics
@@ -658,18 +273,17 @@ async def lyrics(ctx, *, song: str = None):
 
 @bot.command()
 async def radio(ctx, *, query: str = None):
-    gid = ctx.guild.id
+    service = get_music_service(ctx.guild.id)
 
     if not query or query.lower() == "off":
-        clear_radio_state(gid)
+        service.stop_radio()
         await ctx.send("📻 Radio desactivada.")
         return
 
     if not await connect_to_author_voice(ctx):
         return
 
-    radio_query[gid] = query
-    reset_radio_state(gid)
+    service.start_radio(query)
 
     embed = discord.Embed(
         title="📻 Radio activada",
@@ -678,10 +292,10 @@ async def radio(ctx, *, query: str = None):
     )
     await ctx.send(embed=embed)
 
-    if await radio_next(ctx):
-        await ensure_playing(ctx)
+    if await service.radio_next():
+        await service.ensure_playing()
     else:
-        radio_query.pop(gid, None)
+        service.stop_radio()
         await ctx.send("❌ No se encontraron canciones para ese estilo.")
 
 
@@ -693,6 +307,7 @@ async def dj(ctx, *, request: str = None):
         return
 
     gid = ctx.guild.id
+    service = get_music_service(gid)
     await ctx.send("🤔 Pensando...")
 
     plan = await ai_dj.plan_playlist(request, DJ_MAX_SONGS, DJ_DEFAULT_MAX_DURATION_S)
@@ -716,14 +331,14 @@ async def dj(ctx, *, request: str = None):
         if not ctx.voice_client or not ctx.voice_client.is_connected():
             break
         try:
-            entries = await search_entries(suggestion, search_count=3)
+            entries = await radio_engine.search_entries(service.extract_info, suggestion, search_count=3)
         except Exception as e:
             print(f"DJ error buscando '{suggestion}': {e}")
             skipped.append(suggestion)
             continue
 
-        pick = next((e for e in entries if is_playable_candidate(e, max_duration_s, seen_ids)), None)
-        title = enqueue_entry(gid, pick) if pick else None
+        pick = next((e for e in entries if radio_engine.is_playable_candidate(e, max_duration_s, seen_ids)), None)
+        title = radio_engine.enqueue_entry(players.get(gid), pick) if pick else None
         if title is None:
             skipped.append(suggestion)
             continue
@@ -731,7 +346,7 @@ async def dj(ctx, *, request: str = None):
         seen_ids.add(pick["id"])
         added.append(title)
         if len(added) == 1:
-            await ensure_playing(ctx)
+            await service.ensure_playing()
 
     if not added:
         return await ctx.send("❌ No encontré canciones que cumplan con el pedido.")
@@ -783,11 +398,7 @@ async def repo(ctx):
 
 @bot.command()
 async def loop(ctx):
-    gid = ctx.guild.id
-    modes = ["off", "song", "queue"]
-    current = loop_mode.get(gid, "off")
-    next_mode = modes[(modes.index(current) + 1) % len(modes)]
-    loop_mode[gid] = next_mode
+    next_mode = get_music_service(ctx.guild.id).cycle_loop()
     labels = {
         "off":   "➡️ Loop **desactivado**.",
         "song":  "🔂 Repitiendo **canción actual**.",
@@ -813,77 +424,7 @@ async def clear(ctx, num: int):
     await ctx.send(f"🧹 Eliminados {count} mensajes.", delete_after=5)
 
 
-_RANK_EMOJI = {
-    "IRON": "🔩", "BRONZE": "🥉", "SILVER": "🥈", "GOLD": "🥇",
-    "PLATINUM": "🌿", "EMERALD": "💚", "DIAMOND": "💎",
-    "MASTER": "👑", "GRANDMASTER": "🏆", "CHALLENGER": "🔥",
-}
-
-_RANK_COLOR = {
-    "IRON": 0x4a4a4a, "BRONZE": 0xcd7f32, "SILVER": 0xa8a9ad,
-    "GOLD": 0xffd700, "PLATINUM": 0x4da6a8, "EMERALD": 0x149c50,
-    "DIAMOND": 0x5b85f5, "MASTER": 0x9c4dcc,
-    "GRANDMASTER": 0xd45a2a, "CHALLENGER": 0xf4c874,
-}
-
-_TIER_ORDER = ["IRON","BRONZE","SILVER","GOLD","PLATINUM","EMERALD","DIAMOND","MASTER","GRANDMASTER","CHALLENGER"]
-
-
-def _fmt_rank(entry: dict | None) -> str:
-    if not entry:
-        return "*Sin clasificar*"
-    tier = entry["tier"]
-    division = entry.get("rank", "")
-    lp = entry["leaguePoints"]
-    wins, losses = entry["wins"], entry["losses"]
-    wr = round(wins / (wins + losses) * 100) if (wins + losses) else 0
-    emoji = _RANK_EMOJI.get(tier, "")
-    return (
-        f"{emoji} **{tier.capitalize()} {division}**\n"
-        f"`{lp} LP` · {wins}V / {losses}D\n"
-        f"**{wr}%** winrate"
-    )
-
-
-def _best_tier(entries: list) -> str | None:
-    tiers = [e["tier"] for e in entries if "tier" in e]
-    return max(tiers, key=lambda t: _TIER_ORDER.index(t) if t in _TIER_ORDER else -1, default=None)
-
-
-async def _fetch_lol_player(session: aiohttp.ClientSession, riot_id: str, headers: dict) -> dict | str:
-    """Fetches account, summoner and ranked data. Returns a dict or an error string."""
-    game_name, tag_line = riot_id.rsplit("#", 1)
-    url = f"https://{RIOT_ROUTING}.api.riotgames.com/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-    async with session.get(url, headers=headers) as r:
-        if r.status == 404:
-            return f"❌ `{riot_id}` no encontrado."
-        if r.status in (401, 403):
-            return "❌ API key inválida o expirada."
-        if r.status != 200:
-            return f"❌ Error Riot API ({r.status})."
-        account = await r.json()
-
-    puuid = account["puuid"]
-
-    async with session.get(
-        f"https://{RIOT_PLATFORM}.api.riotgames.com/lol/summoner/v4/summoners/by-puuid/{puuid}",
-        headers=headers,
-    ) as r:
-        summoner = await r.json() if r.status == 200 else {}
-
-    async with session.get(
-        f"https://{RIOT_PLATFORM}.api.riotgames.com/lol/league/v4/entries/by-puuid/{puuid}",
-        headers=headers,
-    ) as r:
-        entries = await r.json() if r.status == 200 else []
-
-    return {
-        "account": account,
-        "summoner": summoner,
-        "solo": next((e for e in entries if e["queueType"] == "RANKED_SOLO_5x5"), None),
-        "flex": next((e for e in entries if e["queueType"] == "RANKED_FLEX_SR"), None),
-        "entries": entries,
-    }
+lol_service = LolService(RiotApi(RIOT_API_KEY, RIOT_PLATFORM, RIOT_ROUTING))
 
 
 @bot.command()
@@ -891,98 +432,16 @@ async def invocador(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!invocador NombreJugador#TAG`")
     if "#" not in nombre:
-        return await ctx.send("❌ Incluí el tag. Ejemplo: `!invocador Faker#KR1`")
+        return await ctx.send("❌ Incluye el tag. Ejemplo: `!invocador Faker#KR1`")
     if not RIOT_API_KEY:
         return await ctx.send("❌ RIOT_API_KEY no configurada en el servidor.")
 
-    game_name, tag_line = nombre.rsplit("#", 1)
-    headers = {"X-Riot-Token": RIOT_API_KEY}
-
     await ctx.send(f"🔍 Buscando **{nombre}**...")
-
     try:
-        async with aiohttp.ClientSession() as session:
-            # 1. PUUID desde Riot ID
-            url = (
-                f"https://{RIOT_ROUTING}.api.riotgames.com"
-                f"/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
-            )
-            async with session.get(url, headers=headers) as r:
-                if r.status == 404:
-                    return await ctx.send(f"❌ `{nombre}` no encontrado.")
-                if r.status in (401, 403):
-                    return await ctx.send("❌ API key inválida o expirada.")
-                if r.status != 200:
-                    return await ctx.send(f"❌ Error Riot API ({r.status}).")
-                account = await r.json()
-
-            # 2. Summoner por PUUID — solo para nivel e ícono (id ya no se devuelve)
-            url = (
-                f"https://{RIOT_PLATFORM}.api.riotgames.com"
-                f"/lol/summoner/v4/summoners/by-puuid/{account['puuid']}"
-            )
-            async with session.get(url, headers=headers) as r:
-                summoner = await r.json() if r.status == 200 else {}
-
-            # 3. Ranked por PUUID (endpoint nuevo, no requiere summonerId)
-            url = (
-                f"https://{RIOT_PLATFORM}.api.riotgames.com"
-                f"/lol/league/v4/entries/by-puuid/{account['puuid']}"
-            )
-            async with session.get(url, headers=headers) as r:
-                if r.status != 200:
-                    return await ctx.send(f"❌ Error obteniendo ranked ({r.status}).")
-                entries = await r.json()
-
-    except aiohttp.ClientError as e:
-        print(f"Riot API error: {e}")
-        return await ctx.send("❌ Error de red al consultar la API de Riot.")
-
-    solo = next((e for e in entries if e["queueType"] == "RANKED_SOLO_5x5"), None)
-    flex = next((e for e in entries if e["queueType"] == "RANKED_FLEX_SR"), None)
-    icon_id = summoner.get("profileIconId", 0)
-    level = summoner.get("summonerLevel", "?")
-
-    best = _best_tier(entries)
-    color = _RANK_COLOR.get(best, 0x5865f2) if best else 0x5865f2
-
-    embed = discord.Embed(
-        title=f"{account['gameName']}#{account['tagLine']}",
-        description=f"Nivel **{level}** · {RIOT_PLATFORM.upper()}",
-        color=color,
-    )
-    embed.add_field(name="🎯 Solo/Duo", value=_fmt_rank(solo), inline=True)
-    embed.add_field(name="👥 Flex 5v5", value=_fmt_rank(flex), inline=True)
-    embed.set_thumbnail(
-        url=f"https://ddragon.leagueoflegends.com/cdn/15.1.1/img/profileicon/{icon_id}.png"
-    )
-    embed.set_footer(
-        text="League of Legends · Riot Games API",
-        icon_url="https://cdn.communitydragon.org/latest/asset/ASSETS/Riot_Games/Logos/LoL_Icon_RGB.png",
-    )
-    await ctx.send(embed=embed)
-
-
-def _rank_score(entry: dict | None) -> float:
-    if not entry:
-        return -1.0
-    tier_idx = _TIER_ORDER.index(entry["tier"]) if entry["tier"] in _TIER_ORDER else 0
-    div_bonus = {"I": 3, "II": 2, "III": 1, "IV": 0}.get(entry.get("rank", "IV"), 0)
-    return tier_idx * 4 + div_bonus + entry["leaguePoints"] / 100
-
-
-def _wr(entry: dict | None) -> float:
-    if not entry:
-        return -1.0
-    w, l = entry["wins"], entry["losses"]
-    return round(w / (w + l) * 100, 1) if (w + l) else 0.0
-
-
-def _cmp(a, b) -> tuple[str, str]:
-    """Returns (indicator_a, indicator_b). 🟢 = wins, 🔴 = loses, ⚪ = tie."""
-    if a > b:   return "🟢", "🔴"
-    if b > a:   return "🔴", "🟢"
-    return "⚪", "⚪"
+        player = await lol_service.summoner(nombre)
+    except RiotLookupError as error:
+        return await ctx.send(f"❌ {error}")
+    await ctx.send(embed=build_summoner_embed(player, RIOT_PLATFORM))
 
 
 @bot.command()
@@ -997,93 +456,17 @@ async def vs(ctx, *, nombres: str = None):
         return await ctx.send("❌ Necesito dos Riot IDs. Ejemplo: `!vs maxipepsi#CHL FatReign#KFC`")
 
     await ctx.send(f"⚔️ Comparando **{ids[0]}** vs **{ids[1]}**...")
-
-    headers = {"X-Riot-Token": RIOT_API_KEY}
     try:
-        async with aiohttp.ClientSession() as session:
-            p1, p2 = await asyncio.gather(
-                _fetch_lol_player(session, ids[0], headers),
-                _fetch_lol_player(session, ids[1], headers),
-            )
-    except aiohttp.ClientError as e:
-        print(f"Riot VS error: {e}")
-        return await ctx.send("❌ Error de red al consultar la API de Riot.")
-
-    if isinstance(p1, str):
-        return await ctx.send(p1)
-    if isinstance(p2, str):
-        return await ctx.send(p2)
-
-    name1 = f"{p1['account']['gameName']}#{p1['account']['tagLine']}"
-    name2 = f"{p2['account']['gameName']}#{p2['account']['tagLine']}"
-
-    # ── comparación por categoría ──
-    solo_r1, solo_r2 = _cmp(_rank_score(p1["solo"]), _rank_score(p2["solo"]))
-    solo_w1, solo_w2 = _cmp(_wr(p1["solo"]), _wr(p2["solo"]))
-    flex_r1, flex_r2 = _cmp(_rank_score(p1["flex"]), _rank_score(p2["flex"]))
-    flex_w1, flex_w2 = _cmp(_wr(p1["flex"]), _wr(p2["flex"]))
-
-    pts1 = sum(2 if i == "🟢" else (1 if i == "⚪" else 0) for i in [solo_r1, solo_w1, flex_r1, flex_w1])
-    pts2 = sum(2 if i == "🟢" else (1 if i == "⚪" else 0) for i in [solo_r2, solo_w2, flex_r2, flex_w2])
-
-    def player_field(p, sr, sw, fr, fw) -> str:
-        lvl   = p["summoner"].get("summonerLevel", "?")
-        s     = p["solo"]
-        f     = p["flex"]
-        s_wr  = f"{_wr(s):.0f}%" if s else "—"
-        f_wr  = f"{_wr(f):.0f}%" if f else "—"
-        s_lbl = f"{_RANK_EMOJI.get(s['tier'],'')} {s['tier'].capitalize()} {s.get('rank','')} · {s['leaguePoints']} LP" if s else "Sin clasificar"
-        f_lbl = f"{_RANK_EMOJI.get(f['tier'],'')} {f['tier'].capitalize()} {f.get('rank','')} · {f['leaguePoints']} LP" if f else "Sin clasificar"
-        return (
-            f"Nivel **{lvl}**\n\n"
-            f"🎯 **Solo/Duo**\n{sr} {s_lbl}\n{sw} WR: **{s_wr}**\n\n"
-            f"👥 **Flex**\n{fr} {f_lbl}\n{fw} WR: **{f_wr}**"
-        )
-
-    if pts1 > pts2:
-        verdict = f"🏆 **{name1}** es superior ({pts1//2}-{pts2//2})"
-        winner_tier = _best_tier(p1["entries"])
-    elif pts2 > pts1:
-        verdict = f"🏆 **{name2}** es superior ({pts2//2}-{pts1//2})"
-        winner_tier = _best_tier(p2["entries"])
-    else:
-        verdict = "🤝 **Empate** — estadísticas muy parejas"
-        winner_tier = _best_tier(p1["entries"] + p2["entries"])
-
-    color = _RANK_COLOR.get(winner_tier, 0x5865f2) if winner_tier else 0x5865f2
-
-    embed = discord.Embed(title=f"⚔️ {name1}  vs  {name2}", color=color)
-    embed.add_field(name=name1, value=player_field(p1, solo_r1, solo_w1, flex_r1, flex_w1), inline=True)
-    embed.add_field(name=name2, value=player_field(p2, solo_r2, solo_w2, flex_r2, flex_w2), inline=True)
-    embed.add_field(name="Veredicto", value=verdict, inline=False)
-    embed.set_footer(
-        text="League of Legends · Riot Games API",
-        icon_url="https://cdn.communitydragon.org/latest/asset/ASSETS/Riot_Games/Logos/LoL_Icon_RGB.png",
-    )
-    await ctx.send(embed=embed)
+        comparison = await lol_service.compare(ids[0], ids[1])
+    except RiotLookupError as error:
+        return await ctx.send(f"❌ {error}")
+    await ctx.send(embed=build_comparison_embed(comparison))
 
 
 # ──────────────────── PLAYLISTS ────────────────────
 
 PLAYLISTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "playlists")
 os.makedirs(PLAYLISTS_DIR, exist_ok=True)
-
-
-def _pl_path(gid: int) -> str:
-    return os.path.join(PLAYLISTS_DIR, f"{gid}.json")
-
-
-def _load_playlists(gid: int) -> dict:
-    path = _pl_path(gid)
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_playlists(gid: int, data: dict) -> None:
-    with open(_pl_path(gid), "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 @bot.group(name="playlist", aliases=["pl"], invoke_without_command=True)
@@ -1105,11 +488,11 @@ async def pl_create(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist create <nombre>`")
     nombre = nombre.lower().strip()
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if nombre in data:
         return await ctx.send(f"❌ Ya existe la playlist **{nombre}**.")
     data[nombre] = []
-    _save_playlists(ctx.guild.id, data)
+    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"✅ Playlist **{nombre}** creada. Agrega canciones con `!playlist add {nombre}`.")
 
 
@@ -1118,17 +501,17 @@ async def pl_add(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist add <nombre>`")
     nombre = nombre.lower().strip()
-    song = current_song.get(ctx.guild.id)
+    song = players.get(ctx.guild.id).current
     if not song:
         return await ctx.send("❌ No hay ninguna canción sonando ahora.")
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if nombre not in data:
         return await ctx.send(f"❌ No existe la playlist **{nombre}**. Créala con `!playlist create {nombre}`.")
     entry = {"title": song["title"], "url": song["url"]}
     if entry in data[nombre]:
         return await ctx.send(f"⚠️ **{song['title']}** ya está en **{nombre}**.")
     data[nombre].append(entry)
-    _save_playlists(ctx.guild.id, data)
+    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"✅ **{song['title']}** agregada a **{nombre}** ({len(data[nombre])} canciones).")
 
 
@@ -1137,21 +520,21 @@ async def pl_load(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist load <nombre>`")
     nombre = nombre.lower().strip()
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if nombre not in data or not data[nombre]:
         return await ctx.send(f"❌ La playlist **{nombre}** no existe o está vacía.")
     if not await connect_to_author_voice(ctx):
         return
     songs = data[nombre]
     for entry in songs:
-        queues.setdefault(ctx.guild.id, []).append((entry["url"], entry["title"]))
+        players.get(ctx.guild.id).enqueue(entry["url"], entry["title"])
     await ctx.send(f"📋 **{nombre}** cargada — {len(songs)} canciones añadidas a la cola.")
-    await ensure_playing(ctx)
+    await get_music_service(ctx.guild.id).ensure_playing()
 
 
 @playlist.command(name="list")
 async def pl_list(ctx):
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if not data:
         return await ctx.send("❌ No hay playlists guardadas en este servidor.")
     embed = discord.Embed(title="📋 Playlists del servidor", color=discord.Color.blurple())
@@ -1165,7 +548,7 @@ async def pl_show(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist show <nombre>`")
     nombre = nombre.lower().strip()
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if nombre not in data:
         return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
     songs = data[nombre]
@@ -1184,14 +567,14 @@ async def pl_remove(ctx, nombre: str = None, posicion: int = None):
     if not nombre or posicion is None:
         return await ctx.send("❌ Uso: `!playlist remove <nombre> <posición>`")
     nombre = nombre.lower().strip()
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if nombre not in data:
         return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
     songs = data[nombre]
     if posicion < 1 or posicion > len(songs):
         return await ctx.send(f"❌ Posición inválida. La playlist tiene {len(songs)} canciones.")
     removed = songs.pop(posicion - 1)
-    _save_playlists(ctx.guild.id, data)
+    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"🗑️ **{removed['title']}** eliminada de **{nombre}**.")
 
 
@@ -1200,11 +583,11 @@ async def pl_delete(ctx, *, nombre: str = None):
     if not nombre:
         return await ctx.send("❌ Uso: `!playlist delete <nombre>`")
     nombre = nombre.lower().strip()
-    data = _load_playlists(ctx.guild.id)
+    data = playlist_store.load_playlists(PLAYLISTS_DIR, ctx.guild.id)
     if nombre not in data:
         return await ctx.send(f"❌ No existe la playlist **{nombre}**.")
     del data[nombre]
-    _save_playlists(ctx.guild.id, data)
+    playlist_store.save_playlists(PLAYLISTS_DIR, ctx.guild.id, data)
     await ctx.send(f"🗑️ Playlist **{nombre}** eliminada.")
 
 
@@ -1222,46 +605,36 @@ async def reiniciar(ctx):
     os._exit(0)
 
 
-ALONE_TIMEOUT = 180  # segundos hasta desconectarse si el canal queda vacio
+AGENT_DISABLED_VALUES = {"false", "0", "no", "off"}
 
 
-async def _alone_timeout(vc: discord.VoiceClient, gid: int) -> None:
-    await asyncio.sleep(ALONE_TIMEOUT)
-    if not vc.is_connected():
-        return
-    if any(not m.bot for m in vc.channel.members):
-        return
-    cleanup_audio_file(gid)
-    queues.pop(gid, None)
-    current_song.pop(gid, None)
-    loop_mode.pop(gid, None)
-    clear_radio_state(gid)
-    alone_tasks.pop(gid, None)
-    async with get_voice_lock(gid):
-        if vc.is_connected():
-            await vc.disconnect()
-    ch = last_text_channel.get(gid)
-    if ch:
-        try:
-            await ch.send("👋 Me fui porque quedé solo en el canal.")
-        except Exception:
-            pass
+def agent_enabled(env=os.environ) -> bool:
+    return env.get("AGENT_ENABLED", "true").strip().lower() not in AGENT_DISABLED_VALUES
+
+
+def install_agent(env=os.environ):
+    if not agent_enabled(env):
+        print("[agente] deshabilitado por AGENT_ENABLED")
+        return None
+    try:
+        from agent.adapters import GeniusLyrics, RunContextFactory
+        from agent.listener import AgentListener
+        from agent.model import build_runner
+
+        runner = build_runner(env)
+        context_factory = RunContextFactory(get_music_service, lol_service, GeniusLyrics(), lambda: PLAYLISTS_DIR)
+        listener = AgentListener(runner, context_factory, bot)
+    except Exception as error:
+        print(f"[agente] deshabilitado: {type(error).__name__}: {error}")
+        return None
+    bot.add_listener(listener.on_message, "on_message")
+    print("[agente] activo")
+    return listener
 
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    for vc in bot.voice_clients:
-        if vc.guild != member.guild or not vc.is_connected():
-            continue
-        gid = vc.guild.id
-        humans = [m for m in vc.channel.members if not m.bot]
-        if not humans:
-            if gid not in alone_tasks or alone_tasks[gid].done():
-                alone_tasks[gid] = asyncio.create_task(_alone_timeout(vc, gid))
-        else:
-            task = alone_tasks.pop(gid, None)
-            if task and not task.done():
-                task.cancel()
+    get_music_service(member.guild.id).refresh_alone_watch()
 
 
 @bot.event
@@ -1269,4 +642,5 @@ async def on_ready():
     print(f"[OK] {bot.user} listo.")
 
 
-bot.run(os.getenv("DISCORD_TOKEN"))
+if __name__ == "__main__":
+    bot.run(os.getenv("DISCORD_TOKEN"))
