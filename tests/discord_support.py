@@ -31,8 +31,9 @@ class FakeTyping:
 
 
 class FakeTextChannel:
-    def __init__(self, channel_id=50):
+    def __init__(self, channel_id=50, name=None):
         self.id = channel_id
+        self.name = name
         self.sent = []
         self.send_error = None
         self.typing_error = None

@@ -1,13 +1,17 @@
 import pytest
 
 from agent.trigger import extract_request
-from tests.discord_support import BOT_ID, FakeBotUser, FakeIncomingMessage, FakeSender
+from tests.discord_support import BOT_ID, FakeBotUser, FakeIncomingMessage, FakeSender, FakeTextChannel
 
 BOT = FakeBotUser()
 
 
 def message(content, **kwargs):
     return FakeIncomingMessage(content, **kwargs)
+
+
+def in_channel(content, name="temas", **kwargs):
+    return message(content, channel=FakeTextChannel(name=name), **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -98,3 +102,28 @@ def test_bare_name_returns_empty_text_so_the_listener_can_answer_without_llm():
 
 def test_unready_bot_user_never_triggers():
     assert extract_request(message("makakiño pon algo"), None) is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["pon algo de Feid", "PON ALGO DE FEID", "saca la 3 de la cola", "busca la letra de esta"],
+)
+def test_auto_channel_triggers_without_name_or_mention(content):
+    assert extract_request(in_channel(content), BOT) == content
+
+
+@pytest.mark.parametrize("content", ["jaja", "dale men", "buenísimo eso", "hola a todos"])
+def test_auto_channel_ignores_short_or_no_verb_messages(content):
+    assert extract_request(in_channel(content), BOT) is None
+
+
+def test_auto_channel_name_match_is_case_insensitive():
+    assert extract_request(in_channel("pon algo de Feid", name="TEMAS"), BOT) == "pon algo de Feid"
+
+
+def test_auto_channel_does_not_apply_outside_temas():
+    assert extract_request(in_channel("pon algo de Feid", name="general"), BOT) is None
+
+
+def test_auto_channel_still_strips_the_name_prefix_when_present():
+    assert extract_request(in_channel("makakiño pon algo"), BOT) == "pon algo"

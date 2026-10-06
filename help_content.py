@@ -8,7 +8,8 @@ HELP_SECTIONS = (
     (
         "Cómo hablarme",
         "Mencióname con @, empieza tu mensaje con \"makakiño\" o responde a uno de mis mensajes. "
-        "Puedes pedirme las cosas con tus propias palabras.",
+        "En el canal #temas no necesitas nombrarme: cualquier pedido con un verbo claro (pon, saca, busca, etc.) "
+        "me llega directo. Puedes pedirme las cosas con tus propias palabras.",
     ),
     (
         "Ejemplos",
