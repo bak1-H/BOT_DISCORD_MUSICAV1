@@ -13,6 +13,9 @@ from voice.audio import SAMPLE_WIDTH, TARGET_RATE
 DEFAULT_STT_TIMEOUT_S = 20.0
 TRANSCRIPTION_PROMPT = (
     "Transcribe literalmente el audio, que está en español de Chile. "
+    "Los nombres propios de artistas, bandas y canciones (a menudo nombres en inglés dichos con acento español) "
+    "escríbelos con su ortografía habitual, por ejemplo \"Bad Bunny\", \"Feid\" o \"Nightcore\", "
+    "cuando el audio claramente se refiera a ellos. "
     "Devuelve solo el texto hablado, sin comentarios, comillas ni explicaciones. "
     "Si no hay voz, devuelve una cadena vacía."
 )

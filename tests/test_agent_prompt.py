@@ -140,6 +140,24 @@ async def test_voice_hint_forbids_assuming_destructive_or_ambiguous_requests(tmp
     assert '"brutal", "está buenísima"' in prompt
 
 
+async def test_voice_hint_asks_to_correct_misheard_artist_names_or_ask(tmp_path):
+    rig = build_rig(tmp_path)
+    rig.ctx.by_voice = True
+
+    prompt = build_turn_prompt(rig.ctx, "ponme Batpony")
+
+    assert 'por sonido parecido' in prompt
+    assert '"Batpony" por "Bad Bunny"' in prompt
+    assert "antes de buscar" in prompt
+    assert "pregunta al usuario en vez de adivinar" in prompt
+
+
+async def test_text_turns_never_carry_the_misheard_name_rule(tmp_path):
+    rig = build_rig(tmp_path)
+
+    assert "Batpony" not in build_turn_prompt(rig.ctx, "ponme Bad Bunny")
+
+
 async def test_text_turns_never_carry_the_destructive_voice_rule(tmp_path):
     rig = build_rig(tmp_path)
 

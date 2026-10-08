@@ -86,6 +86,20 @@ async def test_capability_question_is_answered_from_prompt_with_zero_tool_calls(
     assert reply.text == "Puedo reproducir, hacer cola y más."
 
 
+async def test_voice_turn_uses_the_same_number_of_model_calls_as_a_text_turn(tmp_path):
+    counts = {}
+    for by_voice in (False, True):
+        rig = build_rig(tmp_path)
+        rig.ctx.by_voice = by_voice
+        model = ScriptedChatModel(ai_calls(tool_call("get_queue")), ai_text("Lista."))
+
+        await make_runner(model).run(rig.ctx, "ponme Bad Bunny")
+
+        counts[by_voice] = len(model.calls)
+
+    assert counts == {False: 2, True: 2}
+
+
 async def test_seventh_tool_call_is_not_executed_and_turn_ends_with_partial_result(tmp_path):
     rig = build_rig(tmp_path)
     model = ScriptedChatModel(repeat=ai_calls(tool_call("set_loop", mode="song")))

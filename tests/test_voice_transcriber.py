@@ -68,6 +68,26 @@ async def test_gemini_transcriber_sends_the_wav_and_returns_stripped_text():
     assert contents[1] == TRANSCRIPTION_PROMPT
 
 
+def test_transcription_prompt_stays_literal_and_asks_for_standard_artist_spelling():
+    assert "Transcribe literalmente" in TRANSCRIPTION_PROMPT
+    assert "español de Chile" in TRANSCRIPTION_PROMPT
+    assert "artistas, bandas y canciones" in TRANSCRIPTION_PROMPT
+    assert "ortografía habitual" in TRANSCRIPTION_PROMPT
+    for name in ("Bad Bunny", "Feid", "Nightcore"):
+        assert name in TRANSCRIPTION_PROMPT
+    assert "sin comentarios" in TRANSCRIPTION_PROMPT
+    assert "cadena vacía" in TRANSCRIPTION_PROMPT
+
+
+async def test_gemini_transcriber_makes_a_single_request_with_the_prompt():
+    models = FakeModels()
+
+    await GeminiTranscriber(fake_client(models), "m").transcribe(b"wav")
+
+    assert len(models.calls) == 1
+    assert models.calls[0][1][1] == TRANSCRIPTION_PROMPT
+
+
 @pytest.mark.parametrize("text", [None, "", "   "])
 async def test_gemini_transcriber_returns_an_empty_string_when_there_is_no_speech(text):
     assert await GeminiTranscriber(fake_client(FakeModels(text=text)), "m").transcribe(b"wav") == ""
