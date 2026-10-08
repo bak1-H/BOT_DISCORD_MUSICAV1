@@ -181,6 +181,25 @@ def test_a_failing_recognizer_factory_is_logged_once_and_then_yields_no_hit(caps
     assert capsys.readouterr().out.count("[voz]") == 1
 
 
+def test_warmup_loads_the_recognizer_before_the_first_segment_and_failures_disable_the_detector(capsys):
+    factory = FakeRecognizerFactory()
+    detector = VoskWakeDetector(factory)
+
+    detector.warmup()
+
+    assert len(factory.created) == 1
+
+    def broken(grammar):
+        raise ImportError("vosk")
+
+    failing = VoskWakeDetector(broken)
+    failing.warmup()
+
+    assert failing.failed is True
+    assert failing.detect(tone(1.0)) is None
+    assert capsys.readouterr().out.count("[voz]") == 1
+
+
 def test_result_is_read_when_the_recognizer_accepts_a_waveform():
     factory = FakeRecognizerFactory(["oye", "maca", "kino"], accepts=True)
 

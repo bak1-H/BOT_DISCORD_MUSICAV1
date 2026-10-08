@@ -28,6 +28,14 @@ def tone(seconds, amplitude=8000, rate=16000):
     )
 
 
+def stereo_tone(seconds, amplitude=8000):
+    samples = int(seconds * 48000)
+    return b"".join(
+        struct.pack("<hh", value, value)
+        for value in (int(amplitude * math.sin(2 * math.pi * 440 * index / 48000)) for index in range(samples))
+    )
+
+
 def silence(seconds, rate=16000):
     return bytes(int(seconds * rate) * 2)
 
@@ -56,6 +64,19 @@ class FakeTranscriber:
         if self.error is not None:
             raise self.error
         return self.text
+
+
+class FakeDetector:
+    def __init__(self, hits=(), error=None):
+        self.hits = list(hits)
+        self.error = error
+        self.segments = []
+
+    def detect(self, pcm_16k):
+        self.segments.append(pcm_16k)
+        if self.error is not None:
+            raise self.error
+        return self.hits.pop(0) if self.hits else None
 
 
 class FakeRecognizer:

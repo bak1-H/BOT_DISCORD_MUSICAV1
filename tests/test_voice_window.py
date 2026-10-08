@@ -1,3 +1,6 @@
+import sys
+import threading
+
 from voice.audio import BYTES_PER_SECOND
 from voice.window import (
     CommandWindow,
@@ -301,3 +304,75 @@ async def test_voice_message_reply_goes_to_the_text_channel():
     assert sent == [("hola", {"view": None})]
     assert message.mentions == []
     assert message.reference is None
+
+
+def test_reset_from_another_thread_waits_for_a_tick_in_progress():
+    release = threading.Event()
+    entered_clock = threading.Event()
+    window, clock, _ = build_window()
+    window.open(SPEAKER)
+
+    def slow_clock():
+        entered_clock.set()
+        release.wait(timeout=5)
+        return clock()
+
+    window._clock = slow_clock
+    ticker = threading.Thread(target=window.tick)
+    resetter = threading.Thread(target=window.reset)
+    ticker.start()
+    assert entered_clock.wait(timeout=5)
+    resetter.start()
+    resetter.join(timeout=0.3)
+
+    assert resetter.is_alive()
+    release.set()
+    ticker.join(timeout=5)
+    resetter.join(timeout=5)
+
+    assert not ticker.is_alive() and not resetter.is_alive()
+    assert window.state is WindowState.IDLE
+
+
+def test_feed_tick_and_reset_from_two_threads_never_raise_or_corrupt_the_state():
+    window, clock, recorder = build_window(silence_s=0.05, no_speech_s=0.05)
+    errors = []
+    voiced = tone(FRAME_SECONDS)
+    iterations = 400
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+
+    def worker():
+        try:
+            for _ in range(iterations):
+                window.open(SPEAKER)
+                clock.advance(FRAME_SECONDS)
+                window.feed(SPEAKER, voiced)
+                window.tick()
+        except Exception as error:
+            errors.append(error)
+
+    def loop():
+        try:
+            for _ in range(iterations):
+                window.reset()
+        except Exception as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=worker), threading.Thread(target=loop)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+    finally:
+        sys.setswitchinterval(previous_interval)
+
+    window.reset()
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    assert all(user_id == SPEAKER for user_id, _ in recorder.commands)
+    assert window.state is WindowState.IDLE
+    assert window.user_id is None
+    assert window.busy is False

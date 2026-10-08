@@ -62,14 +62,22 @@ class VoskWakeDetector:
         self.accepted = tuple(phrase for phrase in accepted if len(phrase.split()) >= 2)
         self.grammar = json.dumps(list(grammar_phrases) + [UNKNOWN_TOKEN], ensure_ascii=False)
 
-    def detect(self, pcm_16k):
+    def warmup(self):
+        self.build_recognizer()
+
+    def build_recognizer(self):
         if self.failed:
             return None
         try:
-            recognizer = self.recognizer_factory(self.grammar)
+            return self.recognizer_factory(self.grammar)
         except Exception as error:
             self.failed = True
             print(f"[voz] no se pudo cargar el reconocimiento de frase de activación: {error}")
+            return None
+
+    def detect(self, pcm_16k):
+        recognizer = self.build_recognizer()
+        if recognizer is None:
             return None
         pcm = pcm_16k[: self.analyzed_bytes]
         for start in range(0, len(pcm), CHUNK_BYTES):

@@ -1,5 +1,7 @@
 import audioop
+import functools
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -70,6 +72,15 @@ def trailing_audio(segment_pcm, trigger_end_s):
     return segment_pcm[start:]
 
 
+def locked(method):
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class CommandWindow:
     def __init__(
         self,
@@ -82,6 +93,7 @@ class CommandWindow:
         no_speech_s=NO_SPEECH_SECONDS,
         min_tail_s=MIN_TAIL_SECONDS,
     ):
+        self._lock = threading.RLock()
         self._on_open = on_open
         self._on_command = on_command
         self._clock = clock
@@ -98,9 +110,11 @@ class CommandWindow:
         self._last_voice_at = 0.0
 
     @property
+    @locked
     def busy(self):
         return self.state is not WindowState.IDLE
 
+    @locked
     def open(self, user_id, tail_pcm=b""):
         if self.busy:
             return False
@@ -130,6 +144,7 @@ class CommandWindow:
             return False
         return True
 
+    @locked
     def feed(self, user_id, pcm):
         if user_id != self.user_id or self.state not in (WindowState.ARMED, WindowState.CAPTURING):
             return
@@ -148,6 +163,7 @@ class CommandWindow:
             self._last_voice_at = now
         self.tick()
 
+    @locked
     def tick(self):
         now = self._clock()
         if self.state is WindowState.ARMED and now - self._opened_at >= self._no_speech_s:
@@ -160,10 +176,12 @@ class CommandWindow:
             self._buffer = bytearray()
             self._guarded(self._on_command, self.user_id, command)
 
+    @locked
     def speaker_left(self, user_id):
         if user_id == self.user_id and self.state in (WindowState.ARMED, WindowState.CAPTURING):
             self.reset()
 
+    @locked
     def reset(self):
         self.state = WindowState.IDLE
         self.user_id = None

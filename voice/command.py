@@ -63,7 +63,8 @@ class VoiceCommandSession:
 
     async def join(self):
         while self._tasks:
-            await asyncio.gather(*self._tasks)
+            done, _ = await asyncio.wait(set(self._tasks))
+            self._tasks.difference_update(done)
 
     def _spawn(self, coroutine):
         try:

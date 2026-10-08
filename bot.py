@@ -66,6 +66,11 @@ class MusicBot(commands.Bot):
         self.playback_loop = None
         self.agent_listener = None
         self.voice_cls = None
+        self.voice_activation = None
+
+    def on_voice_connected(self, client):
+        if self.voice_activation is not None:
+            self.voice_activation.ensure_listening(client)
 
     async def setup_hook(self):
         self.playback_loop = asyncio.get_running_loop()
@@ -73,6 +78,8 @@ class MusicBot(commands.Bot):
             self.voice_cls = install_voice()
         if self.agent_listener is None:
             self.agent_listener = install_agent()
+        if self.voice_cls is not None and self.voice_activation is None:
+            self.voice_activation = install_voice_activation(self.agent_listener, self.playback_loop)
 
 
 bot = MusicBot(command_prefix="!", intents=intents, case_insensitive=True, help_command=None)
@@ -117,7 +124,12 @@ def get_music_service(guild_id: int) -> MusicService:
         player = players.get(guild_id)
         service = MusicService(
             player=player,
-            voice=DiscordVoiceGateway(bot, guild_id, voice_cls=bot.voice_cls),
+            voice=DiscordVoiceGateway(
+                bot,
+                guild_id,
+                voice_cls=bot.voice_cls,
+                on_connected=bot.on_voice_connected if bot.voice_cls is not None else None,
+            ),
             notifier=ChannelNotifier(player),
             extractor=extractor,
             audio_source_factory=ffmpeg_audio_source,
@@ -652,6 +664,40 @@ def install_voice(env=os.environ):
     return VoiceRecvClient
 
 
+def install_voice_activation(listener, loop, env=os.environ):
+    if listener is None:
+        print("[voz] escucha deshabilitada: el agente no está activo")
+        return None
+    try:
+        from voice.activation import VoiceActivation
+        from voice.audio import rms_threshold_from_env
+        from voice.transcriber import create_gemini_transcriber
+        from voice.wake import create_vosk_detector
+        from voice.window import window_options_from_env
+
+        import importlib.util
+
+        detector = create_vosk_detector(env)
+        if detector is None:
+            raise ValueError("VOICE_VOSK_MODEL_DIR no está configurada")
+        if importlib.util.find_spec("vosk") is None:
+            raise ValueError("el paquete vosk no está instalado")
+        activation = VoiceActivation(
+            detector,
+            listener,
+            create_gemini_transcriber(env),
+            players.get,
+            loop,
+            rms_threshold_from_env(env),
+            window_options_from_env(env),
+        )
+    except Exception as error:
+        print(f"[voz] escucha deshabilitada: {type(error).__name__}: {error}")
+        return None
+    print("[voz] escucha activa")
+    return activation
+
+
 def install_agent(env=os.environ):
     if not agent_enabled(env):
         print("[agente] deshabilitado por AGENT_ENABLED")
@@ -675,6 +721,11 @@ def install_agent(env=os.environ):
 @bot.event
 async def on_voice_state_update(member, before, after):
     get_music_service(member.guild.id).refresh_alone_watch()
+    if bot.voice_activation is not None:
+        try:
+            bot.voice_activation.voice_state_changed(member, before, after)
+        except Exception as error:
+            print(f"[voz] on_voice_state_update: {type(error).__name__}")
 
 
 @bot.event
