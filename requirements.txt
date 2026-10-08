@@ -3,7 +3,9 @@ PyNaCl
 python-dotenv
 lyricsgenius
 yt-dlp[default]
-davey
+davey==0.1.6
+audioop-lts; python_version >= "3.13"
+discord-ext-voice-recv @ git+https://github.com/LeadFreeCandy/discord-ext-voice-recv@bec048127f4148fd147afa3182c3771b6955dc08
 google-genai>=2.20,<3
 aiohttp
 langgraph==1.2.12

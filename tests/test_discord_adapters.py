@@ -69,6 +69,66 @@ async def test_gateway_connect_uses_a_sixty_second_timeout():
     assert channel.timeouts == [60]
 
 
+class ClsRecordingChannel:
+    def __init__(self, client=None):
+        self.calls = []
+        self.client = client
+
+    async def connect(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.client
+
+
+class RecvClientStub:
+    pass
+
+
+async def test_gateway_connect_passes_no_cls_when_unconfigured():
+    channel = ClsRecordingChannel()
+
+    await DiscordVoiceGateway(GuildBook(), 1).connect(channel)
+
+    assert channel.calls == [{"timeout": 60}]
+
+
+async def test_gateway_connect_passes_the_configured_cls():
+    channel = ClsRecordingChannel()
+
+    await DiscordVoiceGateway(GuildBook(), 1, voice_cls=RecvClientStub).connect(channel)
+
+    assert channel.calls == [{"timeout": 60, "cls": RecvClientStub}]
+
+
+async def test_gateway_fires_on_connected_with_the_client_only_on_success():
+    connected = []
+    client = RecvClientStub()
+    gateway = DiscordVoiceGateway(GuildBook(), 1, on_connected=connected.append)
+
+    await gateway.connect(RefusingChannel(asyncio.TimeoutError()))
+    await gateway.connect(RefusingChannel(discord.ClientException("busy")))
+    assert connected == []
+
+    await gateway.connect(ClsRecordingChannel(client))
+    assert connected == [client]
+
+
+async def test_gateway_connect_survives_a_raising_on_connected_callback(capsys):
+    seen = []
+
+    def exploding_callback(client):
+        seen.append(client)
+        raise RuntimeError("callback boom")
+
+    client = RecvClientStub()
+    gateway = DiscordVoiceGateway(GuildBook(), 1, on_connected=exploding_callback)
+
+    result = await gateway.connect(ClsRecordingChannel(client))
+
+    assert result is ConnectResult.CONNECTED
+    assert seen == [client]
+    assert "callback boom" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     "error, expected",
     [
