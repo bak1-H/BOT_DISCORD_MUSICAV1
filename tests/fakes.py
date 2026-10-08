@@ -66,6 +66,25 @@ class FakeVoiceClient:
             after(None)
 
 
+class FakeRecvClient(FakeVoiceClient):
+    def __init__(self, channel=None):
+        super().__init__(channel)
+        self.stop_playing_calls = 0
+        self.listening = True
+
+    def is_listening(self):
+        return self.listening
+
+    def stop_playing(self):
+        self.stop_playing_calls += 1
+        self.playing = False
+        self.paused = False
+
+    def stop(self):
+        super().stop()
+        self.listening = False
+
+
 class RecordingNotifier:
     def __init__(self):
         self.messages = []
