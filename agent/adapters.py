@@ -46,4 +46,5 @@ class RunContextFactory:
             playlists=GuildPlaylists(self._playlists_dir(), guild_id),
             lyrics=self._lyrics,
             lol=self._lol,
+            by_voice=getattr(message, "by_voice", False) is True,
         )

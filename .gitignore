@@ -13,3 +13,5 @@ cookies_refresh.txt
 .refresh_cookies.ps1
 refresh_cookies.ps1
 cookies_small.txt
+tests/fixtures/voice/
+vosk-model*/

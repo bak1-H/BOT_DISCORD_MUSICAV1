@@ -12,6 +12,7 @@ from tests.fakes import (
     FakeExtractor,
     FakeMember,
     FakeRecvClient,
+    FakeSleeper,
     FakeVoiceClient,
     FakeVoiceGateway,
     RecordingNotifier,
@@ -21,7 +22,7 @@ from tests.fakes import (
 GID = 1
 
 
-def build_service(tmp_path, client=None, connect_result=None):
+def build_service(tmp_path, client=None, connect_result=None, **options):
     player = GuildPlayer(GID)
     voice = FakeVoiceGateway(client, connect_result)
     notifier = RecordingNotifier()
@@ -33,6 +34,7 @@ def build_service(tmp_path, client=None, connect_result=None):
         extractor=extractor,
         audio_source_factory=lambda path: FakeAudioSource(path, options="-vn"),
         loop=asyncio.get_running_loop(),
+        **options,
     )
     return SimpleNamespace(service=service, player=player, voice=voice, notifier=notifier, extractor=extractor)
 
@@ -363,3 +365,208 @@ async def test_refresh_alone_watch_ignores_a_guild_without_a_connected_client(tm
     rig.service.refresh_alone_watch()
 
     assert rig.player.alone_task is None
+
+
+IDLE_SECONDS = 900
+
+
+def build_kept_alive(tmp_path, client=None, enabled=True):
+    sleeper = FakeSleeper()
+    rig = build_service(
+        tmp_path,
+        client=client or FakeVoiceClient(),
+        keep_alive=lambda: enabled,
+        idle_timeout_s=IDLE_SECONDS,
+        sleep=sleeper.sleep,
+    )
+    rig.sleeper = sleeper
+    rig.player.text_channel = rig.notifier
+    return rig
+
+
+async def finish_queue(rig):
+    await rig.service._play_next_locked()
+    await settle()
+
+
+async def test_keep_alive_on_leaves_the_bot_connected_when_the_queue_ends(tmp_path):
+    rig = build_kept_alive(tmp_path)
+
+    await finish_queue(rig)
+
+    assert rig.voice.client.disconnect_calls == 0
+    assert rig.voice.client.connected
+    assert rig.player.current is None
+
+
+async def test_keep_alive_off_disconnects_when_the_queue_ends_and_arms_no_timer(tmp_path):
+    rig = build_kept_alive(tmp_path, enabled=False)
+
+    await finish_queue(rig)
+
+    assert rig.voice.client.disconnect_calls == 1
+    assert rig.sleeper.waiters == []
+
+
+async def test_idle_timeout_fires_at_the_configured_time_and_not_before(tmp_path):
+    rig = build_kept_alive(tmp_path)
+    client = rig.voice.client
+    queue_songs(rig.player, "a")
+    await finish_queue(rig)
+    await rig.service.ensure_playing()
+    client.finish_song()
+    await settle(50)
+
+    await rig.sleeper.advance(IDLE_SECONDS - 1)
+    assert client.disconnect_calls == 0
+
+    await rig.sleeper.advance(1)
+    assert client.disconnect_calls == 1
+    assert rig.notifier.has_text_containing("inactividad")
+    assert rig.player.queue == []
+
+
+async def test_idle_timer_is_cancelled_when_music_starts_again(tmp_path):
+    rig = build_kept_alive(tmp_path)
+    client = rig.voice.client
+    await finish_queue(rig)
+    armed = rig.service._idle_task
+    queue_songs(rig.player, "a")
+
+    await rig.service.ensure_playing()
+    await rig.sleeper.advance(IDLE_SECONDS * 2)
+
+    assert armed.cancelled()
+    assert client.disconnect_calls == 0
+    assert client.playing
+
+
+async def test_idle_timer_does_not_cut_a_song_that_started_during_the_wait(tmp_path):
+    rig = build_kept_alive(tmp_path)
+    client = rig.voice.client
+    await finish_queue(rig)
+    client.playing = True
+
+    await rig.sleeper.advance(IDLE_SECONDS)
+
+    assert client.disconnect_calls == 0
+
+
+async def test_stop_cancels_the_idle_timer_and_a_reconnect_arms_a_single_new_one(tmp_path):
+    rig = build_kept_alive(tmp_path)
+    rig.voice.client.connected = True
+    await finish_queue(rig)
+    first = rig.service._idle_task
+
+    await rig.service.stop()
+    await settle()
+    assert first.cancelled()
+
+    await rig.service.connect(object(), rig.notifier)
+    second = rig.service._idle_task
+    new_client = rig.voice.client
+    await settle()
+    await rig.sleeper.advance(IDLE_SECONDS)
+
+    assert second is not first
+    assert new_client.disconnect_calls == 1
+    assert rig.voice.client is new_client
+
+
+class SongEndingClient(FakeVoiceClient):
+    def stop(self):
+        was_playing = self.playing
+        super().stop()
+        after, self.after = self.after, None
+        if was_playing and after:
+            after(None)
+
+    async def disconnect(self, force=False):
+        for _ in range(3):
+            await asyncio.sleep(0)
+        await super().disconnect(force)
+
+
+def pending_idle_tasks(rig):
+    task = rig.service._idle_task
+    return [task] if task and not task.done() else []
+
+
+async def start_song(rig):
+    queue_songs(rig.player, "a")
+    await rig.service.ensure_playing()
+    assert rig.voice.client.playing
+
+
+async def test_stop_while_playing_leaves_no_idle_task_even_when_the_song_end_reenters(tmp_path):
+    rig = build_kept_alive(tmp_path, client=SongEndingClient())
+    await start_song(rig)
+
+    await rig.service.stop()
+    await settle(50)
+
+    assert pending_idle_tasks(rig) == []
+    assert rig.sleeper.waiters == []
+    assert rig.voice.client.disconnect_calls == 1
+
+
+async def test_leave_while_playing_leaves_no_idle_task_even_when_the_song_end_reenters(tmp_path):
+    rig = build_kept_alive(tmp_path, client=SongEndingClient())
+    await start_song(rig)
+
+    assert await rig.service.leave() is True
+    await settle(50)
+
+    assert pending_idle_tasks(rig) == []
+    assert rig.sleeper.waiters == []
+
+
+async def test_a_normal_end_of_queue_still_arms_exactly_one_idle_timer(tmp_path):
+    rig = build_kept_alive(tmp_path, client=SongEndingClient())
+    await start_song(rig)
+
+    rig.voice.client.finish_song()
+    await settle(50)
+
+    assert len(pending_idle_tasks(rig)) == 1
+    assert len(rig.sleeper.waiters) == 1
+
+
+async def test_alone_timeout_still_disconnects_while_kept_alive_and_cancels_the_idle_timer(tmp_path, monkeypatch):
+    from music import service as service_module
+
+    monkeypatch.setattr(service_module, "ALONE_TIMEOUT", 0)
+    client = FakeVoiceClient(channel_with(FakeMember(is_bot=True)))
+    rig = build_kept_alive(tmp_path, client=client)
+    await finish_queue(rig)
+    armed = rig.service._idle_task
+
+    await rig.service.alone_timeout()
+    await settle()
+
+    assert client.disconnect_calls == 1
+    assert armed.cancelled()
+    assert rig.notifier.has_text_containing("quedé solo en el canal")
+
+
+async def test_leave_disconnects_clears_the_session_and_cancels_the_idle_timer(tmp_path):
+    rig = build_kept_alive(tmp_path)
+    client = rig.voice.client
+    client.playing = True
+    queue_songs(rig.player, "a", "b")
+    rig.service._arm_idle()
+    armed = rig.service._idle_task
+
+    assert await rig.service.leave() is True
+    await settle()
+
+    assert client.disconnect_calls == 1
+    assert rig.player.queue == []
+    assert rig.player.current is None
+    assert armed.cancelled()
+
+
+async def test_leave_without_a_connected_client_does_nothing(tmp_path):
+    rig = build_service(tmp_path)
+
+    assert await rig.service.leave() is False

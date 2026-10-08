@@ -66,6 +66,14 @@ class MusicBot(commands.Bot):
         self.playback_loop = None
         self.agent_listener = None
         self.voice_cls = None
+        self.voice_activation = None
+
+    def keeps_voice_alive(self):
+        return self.voice_activation is not None and self.voice_activation.enabled
+
+    def on_voice_connected(self, client):
+        if self.voice_activation is not None:
+            self.voice_activation.ensure_listening(client)
 
     async def setup_hook(self):
         self.playback_loop = asyncio.get_running_loop()
@@ -73,6 +81,8 @@ class MusicBot(commands.Bot):
             self.voice_cls = install_voice()
         if self.agent_listener is None:
             self.agent_listener = install_agent()
+        if self.voice_cls is not None and self.voice_activation is None:
+            self.voice_activation = install_voice_activation(self.agent_listener, self.playback_loop)
 
 
 bot = MusicBot(command_prefix="!", intents=intents, case_insensitive=True, help_command=None)
@@ -117,11 +127,18 @@ def get_music_service(guild_id: int) -> MusicService:
         player = players.get(guild_id)
         service = MusicService(
             player=player,
-            voice=DiscordVoiceGateway(bot, guild_id, voice_cls=bot.voice_cls),
+            voice=DiscordVoiceGateway(
+                bot,
+                guild_id,
+                voice_cls=bot.voice_cls,
+                on_connected=bot.on_voice_connected if bot.voice_cls is not None else None,
+            ),
             notifier=ChannelNotifier(player),
             extractor=extractor,
             audio_source_factory=ffmpeg_audio_source,
             loop=bot.playback_loop,
+            keep_alive=bot.keeps_voice_alive,
+            idle_timeout_s=voice_idle_seconds(),
         )
         music_services[guild_id] = service
     return service
@@ -196,6 +213,48 @@ async def skip(ctx):
 async def stop(ctx):
     await get_music_service(ctx.guild.id).stop()
     await ctx.send("⏹️ Reproducción detenida.")
+
+
+@bot.command(name="salir", aliases=["leave"])
+async def salir(ctx):
+    if await get_music_service(ctx.guild.id).leave():
+        await ctx.send("👋 Me fui del canal de voz.")
+    else:
+        await ctx.send("❌ No estoy en un canal de voz.")
+
+
+VOICE_SWITCH_USAGE = "❌ Uso: `!voz on`, `!voz off` o `!voz estado`."
+VOICE_SWITCH_OWNER_ONLY = "❌ Solo el dueño del bot puede usar este comando."
+VOICE_SWITCH_OWNER_UNVERIFIED = "❌ No pude verificar al dueño del bot en este momento. Inténtalo de nuevo más tarde."
+VOICE_SWITCH_UNAVAILABLE ="❌ La activación por voz no está habilitada en este servidor."
+
+
+def describe_voice_state(activation, guild_id: int) -> str:
+    state = "activada" if activation.enabled else "desactivada"
+    listening = "escuchando" if activation.listening_in(guild_id) else "sin escuchar"
+    return f"🎙️ Activación por voz: **{state}**. En este servidor: **{listening}**."
+
+
+@bot.command(name="voz")
+async def voz(ctx, action: str = None):
+    try:
+        is_owner = await bot.is_owner(ctx.author)
+    except Exception as error:
+        print(f"Owner check failed: {error}")
+        return await ctx.send(VOICE_SWITCH_OWNER_UNVERIFIED)
+    if not is_owner:
+        return await ctx.send(VOICE_SWITCH_OWNER_ONLY)
+    activation = bot.voice_activation
+    if activation is None:
+        return await ctx.send(VOICE_SWITCH_UNAVAILABLE)
+    action = (action or "").lower()
+    if action == "on":
+        activation.enable(bot.voice_clients)
+    elif action == "off":
+        activation.disable()
+    elif action != "estado":
+        return await ctx.send(VOICE_SWITCH_USAGE)
+    await ctx.send(describe_voice_state(activation, ctx.guild.id))
 
 
 @bot.command()
@@ -373,6 +432,7 @@ async def comandos(ctx):
     embed.add_field(name="!play <canción o URL>", value="Reproduce o añade a la cola.", inline=False)
     embed.add_field(name="!skip", value="Salta la canción actual.", inline=False)
     embed.add_field(name="!stop", value="Detiene y desconecta el bot.", inline=False)
+    embed.add_field(name="!salir / !leave", value="El bot sale del canal de voz.", inline=False)
     embed.add_field(name="!pause / !resume", value="Pausa o reanuda la reproducción.", inline=False)
     embed.add_field(name="!queue / !q", value="Muestra la cola de reproducción.", inline=False)
     embed.add_field(name="!np / !nowplaying", value="Muestra la canción actual.", inline=False)
@@ -633,6 +693,19 @@ def agent_enabled(env=os.environ) -> bool:
     return env.get("AGENT_ENABLED", "true").strip().lower() not in AGENT_DISABLED_VALUES
 
 
+DEFAULT_VOICE_IDLE_MINUTES = 15
+
+
+def voice_idle_seconds(env=os.environ) -> float:
+    try:
+        minutes = float(env.get("VOICE_IDLE_MINUTES", ""))
+    except ValueError:
+        minutes = DEFAULT_VOICE_IDLE_MINUTES
+    if minutes <= 0:
+        minutes = DEFAULT_VOICE_IDLE_MINUTES
+    return minutes * 60
+
+
 VOICE_ENABLED_VALUES = {"true", "1", "yes", "on"}
 
 
@@ -650,6 +723,40 @@ def install_voice(env=os.environ):
         return None
     print("[voz] cliente de voz con recepcion instalado")
     return VoiceRecvClient
+
+
+def install_voice_activation(listener, loop, env=os.environ):
+    if listener is None:
+        print("[voz] escucha deshabilitada: el agente no está activo")
+        return None
+    try:
+        from voice.activation import VoiceActivation
+        from voice.audio import rms_threshold_from_env
+        from voice.transcriber import create_gemini_transcriber
+        from voice.wake import create_vosk_detector
+        from voice.window import window_options_from_env
+
+        import importlib.util
+
+        detector = create_vosk_detector(env)
+        if detector is None:
+            raise ValueError("VOICE_VOSK_MODEL_DIR no está configurada")
+        if importlib.util.find_spec("vosk") is None:
+            raise ValueError("el paquete vosk no está instalado")
+        activation = VoiceActivation(
+            detector,
+            listener,
+            create_gemini_transcriber(env),
+            players.get,
+            loop,
+            rms_threshold_from_env(env),
+            window_options_from_env(env),
+        )
+    except Exception as error:
+        print(f"[voz] escucha deshabilitada: {type(error).__name__}: {error}")
+        return None
+    print("[voz] escucha activa")
+    return activation
 
 
 def install_agent(env=os.environ):
@@ -675,6 +782,11 @@ def install_agent(env=os.environ):
 @bot.event
 async def on_voice_state_update(member, before, after):
     get_music_service(member.guild.id).refresh_alone_watch()
+    if bot.voice_activation is not None:
+        try:
+            bot.voice_activation.voice_state_changed(member, before, after)
+        except Exception as error:
+            print(f"[voz] on_voice_state_update: {type(error).__name__}")
 
 
 @bot.event

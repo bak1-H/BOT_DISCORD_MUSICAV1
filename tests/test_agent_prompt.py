@@ -95,3 +95,72 @@ def test_system_prompt_states_the_multi_step_and_no_leak_rules():
     assert "nombres de herramientas" in prompt
     assert "nunca digas que no puedes" in prompt.lower()
     assert "créala" in prompt
+
+
+async def test_text_turn_prompt_is_unchanged_and_has_no_voice_hint(tmp_path):
+    rig = build_rig(tmp_path)
+    rig.player.current = {"title": "Tusa", "url": "u"}
+
+    prompt = build_turn_prompt(rig.ctx, "pon algo de Feid")
+
+    assert prompt == (
+        "<runtime_context>\n"
+        "- en canal de voz: sí\n"
+        "- canción actual: Tusa\n"
+        "- canciones en cola: 0\n"
+        "- loop: off\n"
+        "</runtime_context>\n"
+        "<user_message>\npon algo de Feid\n</user_message>"
+    )
+    assert "voice_input" not in prompt
+
+
+async def test_voice_turn_prompt_adds_the_speech_hint_before_the_context(tmp_path):
+    rig = build_rig(tmp_path)
+    rig.ctx.by_voice = True
+
+    prompt = build_turn_prompt(rig.ctx, "skipea esta")
+
+    assert prompt.startswith("<voice_input>")
+    assert prompt.endswith("<user_message>\nskipea esta\n</user_message>")
+    for expected in ("reconocimiento de voz", "chileno", "skipea", "la raja", "un tema de X", "a la cola", "pedido claro"):
+        assert expected in prompt
+
+
+async def test_voice_hint_forbids_assuming_destructive_or_ambiguous_requests(tmp_path):
+    rig = build_rig(tmp_path)
+    rig.ctx.by_voice = True
+
+    prompt = build_turn_prompt(rig.ctx, "borra la cola")
+
+    assert "destructivos o ambiguos" in prompt
+    assert "no asumas" in prompt
+    assert "con el botón" in prompt
+    assert "no sean destructivos" in prompt
+    assert '"brutal", "está buenísima"' in prompt
+
+
+async def test_text_turns_never_carry_the_destructive_voice_rule(tmp_path):
+    rig = build_rig(tmp_path)
+
+    assert "destructivos o ambiguos" not in build_turn_prompt(rig.ctx, "borra la cola")
+
+
+async def test_voice_hint_has_no_voseo(tmp_path):
+    rig = build_rig(tmp_path)
+    rig.ctx.by_voice = True
+
+    prompt = build_turn_prompt(rig.ctx, "hola").lower()
+
+    for form in VOSEO_FORMS:
+        assert form not in prompt
+
+
+async def test_voice_hint_maps_leaving_to_the_tool_instead_of_a_confirmation(tmp_path):
+    rig = build_rig(tmp_path)
+    rig.ctx.by_voice = True
+
+    prompt = build_turn_prompt(rig.ctx, "sal del canal")
+
+    assert '"sal del canal"' in prompt
+    assert "parar todo, salir del canal" not in prompt

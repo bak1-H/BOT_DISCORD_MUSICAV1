@@ -13,6 +13,7 @@ from music.ytdl import is_youtube_login_block, normalize_youtube_url
 
 MAX_PLAYNEXT_FAILS = 3
 ALONE_TIMEOUT = 180
+IDLE_TIMEOUT = 900
 LOOP_MODES = ["off", "song", "queue"]
 MAX_QUEUE_SONGS_PER_CALL = 15
 
@@ -59,6 +60,9 @@ class MusicService:
         extractor: Extractor,
         audio_source_factory,
         loop: asyncio.AbstractEventLoop,
+        keep_alive=None,
+        idle_timeout_s: float = IDLE_TIMEOUT,
+        sleep=asyncio.sleep,
     ) -> None:
         self.player = player
         self.voice = voice
@@ -66,6 +70,11 @@ class MusicService:
         self.extractor = extractor
         self.audio_source_factory = audio_source_factory
         self.loop = loop
+        self._keep_alive = keep_alive or (lambda: False)
+        self._idle_timeout_s = idle_timeout_s
+        self._sleep = sleep
+        self._idle_task: asyncio.Task | None = None
+        self._stopping = False
 
     async def connect(self, channel, text_channel) -> ConnectResult:
         async with self.player.voice_lock:
@@ -76,6 +85,7 @@ class MusicService:
                 result = await self.voice.connect(channel)
                 if result is not ConnectResult.CONNECTED:
                     return result
+                self._arm_idle()
         self.player.text_channel = text_channel
         return result
 
@@ -237,7 +247,10 @@ class MusicService:
                 return await self._play_next_locked()
             player.current = None
             client = self.voice.client
-            if client:
+            if client and self._keep_alive():
+                if client.is_connected() and not self._stopping:
+                    self._arm_idle()
+            elif client:
                 await client.disconnect()
             return
 
@@ -265,6 +278,7 @@ class MusicService:
                     player.cleanup_audio_file()
                     return
 
+                self._cancel_idle()
                 source = self.audio_source_factory(audio_path)
                 client.play(source, after=self._on_song_end)
 
@@ -291,6 +305,7 @@ class MusicService:
             if player.fail_count >= MAX_PLAYNEXT_FAILS:
                 await self.notifier.send("❌ Falló la reproducción varias veces. Deteniendo y limpiando cola.")
                 player.queue = []
+                self._cancel_idle()
                 async with player.voice_lock:
                     client = self.voice.client
                     if client and client.is_connected():
@@ -321,13 +336,44 @@ class MusicService:
         return False
 
     async def stop(self) -> None:
-        self.player.reset_session()
-        async with self.player.voice_lock:
-            client = self.voice.client
-            if client:
-                _stop_playback(client)
-                if client.is_connected():
-                    await client.disconnect()
+        self._stopping = True
+        try:
+            self._cancel_idle()
+            self.player.reset_session()
+            async with self.player.voice_lock:
+                client = self.voice.client
+                if client:
+                    _stop_playback(client)
+                    if client.is_connected():
+                        await client.disconnect()
+        finally:
+            self._stopping = False
+
+    async def leave(self) -> bool:
+        client = self.voice.client
+        if not client or not client.is_connected():
+            return False
+        await self.stop()
+        return True
+
+    def _cancel_idle(self) -> None:
+        task, self._idle_task = self._idle_task, None
+        if task and not task.done():
+            task.cancel()
+
+    def _arm_idle(self) -> None:
+        self._cancel_idle()
+        if self._keep_alive():
+            self._idle_task = asyncio.create_task(self._idle_timeout())
+
+    async def _idle_timeout(self) -> None:
+        await self._sleep(self._idle_timeout_s)
+        self._idle_task = None
+        client = self.voice.client
+        if not client or not client.is_connected() or self._is_busy():
+            return
+        await self.stop()
+        await self.notifier.send("👋 Me fui por inactividad.")
 
     def cycle_loop(self) -> str:
         current = self.player.loop_mode
@@ -357,6 +403,7 @@ class MusicService:
         if any(not m.bot for m in client.channel.members):
             return
         player = self.player
+        self._cancel_idle()
         player.reset_session()
         player.alone_task = None
         async with player.voice_lock:

@@ -17,6 +17,8 @@ Bot de música para Discord escrito en Python. Reproduce audio de YouTube en can
 | `!play <nombre o URL>` | Reproduce una canción o la añade a la cola |
 | `!skip` | Salta la canción actual |
 | `!stop` | Detiene la reproducción, limpia la cola y desconecta el bot |
+| `!salir` / `!leave` | El bot sale del canal de voz (misma limpieza que `!stop`) |
+| `!voz on\|off\|estado` | Solo el dueño del bot: enciende o apaga la escucha por voz hasta el próximo reinicio |
 | `!pause` | Pausa la reproducción |
 | `!resume` | Reanuda la reproducción pausada |
 | `!queue` / `!q` | Muestra la cola y la canción actual |
@@ -50,6 +52,10 @@ Variables opcionales:
 | `GEMINI_API_KEY` | Activa las funciones con IA: `!dj` y la radio inteligente. Sin ella, `!dj` no está disponible y la radio busca como antes |
 | `GEMINI_MODEL` | Modelo de Gemini para las funciones con IA (por defecto `gemini-3.5-flash-lite`) |
 | `PORT` | Puerto del health check HTTP (por defecto `8080`) |
+| `VOICE_ACTIVATION_ENABLED` | Enciende la activación por voz ("maca quino ..."); con ella el bot no sale al terminar la cola y espera la frase. Apagada por defecto |
+| `VOICE_IDLE_MINUTES` | Con la activación por voz, minutos sin música antes de que el bot salga del canal (por defecto `15`) |
+
+Con la activación por voz encendida, el bot se queda en el canal al terminar la cola y sale con `!salir`, pidiéndoselo por voz o tras `VOICE_IDLE_MINUTES` sin música; `!voz off` es un interruptor en caliente que no se guarda, así que al reiniciar manda `VOICE_ACTIVATION_ENABLED`.
 
 ## Instalación local
 

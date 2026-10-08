@@ -9,7 +9,7 @@ from agent.adapters import GeniusLyrics, GuildPlaylists, RunContextFactory
 from agent.context import PendingAction
 from agent.tools import execute_pending
 from tests.agent_support import build_rig
-from tests.discord_support import FakeIncomingMessage, FakeSender
+from tests.discord_support import FakeIncomingMessage, FakeSender, FakeTextChannel
 
 
 def test_playlists_round_trip_through_the_guild_file(tmp_path):
@@ -173,3 +173,16 @@ async def test_confirmed_playlist_delete_removes_the_real_file_entry(tmp_path):
 
     assert "rock" in message
     assert GuildPlaylists(str(tmp_path), 1).load() == {"pop": []}
+
+
+async def test_factory_marks_voice_messages_and_never_text_messages(tmp_path):
+    from voice.window import VoiceMessage
+
+    rig = build_rig(tmp_path)
+    factory = build_factory(tmp_path, rig)
+    author = FakeSender(user_id=42)
+    voice_message = VoiceMessage(content="hola", author=author, guild=SimpleNamespace(id=1), channel=FakeTextChannel())
+
+    assert factory(voice_message).by_voice is True
+    assert factory(FakeIncomingMessage("hola", author=author)).by_voice is False
+    assert factory(SimpleNamespace(by_voice="yes", guild=SimpleNamespace(id=1), author=author, channel=FakeTextChannel())).by_voice is False
