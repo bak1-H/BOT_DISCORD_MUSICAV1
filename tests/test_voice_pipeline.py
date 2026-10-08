@@ -322,3 +322,39 @@ def test_sink_wants_pcm_and_cleanup_stops_the_worker():
     sink.cleanup()
 
     assert rig.pipeline.stopped
+
+
+def test_wake_hit_prints_debug_details_only_when_enabled(monkeypatch, capsys):
+    monkeypatch.setenv("VOICE_DEBUG", "1")
+    rig = Rig(FakeDetector([WakeHit("oye maca quino", 0.3)]))
+
+    rig.speak(1.0)
+    rig.wait(1.0)
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("[voz-debug]")]
+    assert len(lines) == 1
+    assert "phrase='oye maca quino'" in lines[0]
+    assert "end=0.30s" in lines[0]
+    assert "segment=" in lines[0] and "tail=" in lines[0]
+
+
+def test_wake_hit_still_triggers_when_debug_output_fails(monkeypatch):
+    monkeypatch.setenv("VOICE_DEBUG", "1")
+    monkeypatch.setattr("voice.debug.print", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("broken pipe")), raising=False)
+    rig = Rig(FakeDetector([WakeHit("oye maca quiño", 0.3)]))
+
+    rig.speak(1.0)
+    rig.wait(1.0)
+
+    assert rig.session.triggers
+
+
+def test_wake_hit_prints_nothing_when_debug_is_off(monkeypatch, capsys):
+    monkeypatch.delenv("VOICE_DEBUG", raising=False)
+    rig = Rig(FakeDetector([WakeHit("oye maca quino", 0.3)]))
+
+    rig.speak(1.0)
+    rig.wait(1.0)
+
+    assert rig.session.triggers
+    assert "[voz-debug]" not in capsys.readouterr().out

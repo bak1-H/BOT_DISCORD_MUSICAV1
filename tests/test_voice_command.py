@@ -11,6 +11,7 @@ from agent.runner import AgentReply
 from tests.discord_support import FakeInteraction, FakeTextChannel
 from tests.fakes import RecordingNotifier
 from tests.voice_support import FRAME_BYTES, FRAME_SECONDS, FakeClock, FakeTranscriber, silence, tone
+from voice import debug
 from voice.command import STT_FAILED, VoiceCommandSession, strip_wake_phrase
 from voice.window import WindowState
 
@@ -348,3 +349,91 @@ def make_text_message():
         reference=None,
         reply=None,
     )
+
+
+class SlowTranscriber(FakeTranscriber):
+    def __init__(self, clock, text="", error=None, latency_s=0.25):
+        super().__init__(text, error)
+        self.clock = clock
+        self.latency_s = latency_s
+
+    async def transcribe(self, wav_bytes):
+        self.clock.advance(self.latency_s)
+        return await super().transcribe(wav_bytes)
+
+
+def debug_lines(capsys):
+    return [line for line in capsys.readouterr().out.splitlines() if line.startswith("[voz-debug]")]
+
+
+async def test_debug_on_prints_audio_latency_transcript_and_request(monkeypatch, capsys):
+    monkeypatch.setenv("VOICE_DEBUG", "true")
+    rig = Rig(None)
+    rig.transcriber = rig.session._transcriber = SlowTranscriber(rig.clock, "oye makakiño skipea este tema")
+
+    await rig.say_command()
+
+    lines = debug_lines(capsys)
+    assert any(line.startswith("[voz-debug] stt audio=") and line.endswith("s") for line in lines)
+    assert (
+        "[voz-debug] stt latency=250ms transcript='oye makakiño skipea este tema' request='skipea este tema'" in lines
+    )
+
+
+async def test_debug_on_prints_the_exception_type_and_message_on_stt_errors(monkeypatch, capsys):
+    monkeypatch.setenv("VOICE_DEBUG", "on")
+    rig = Rig(FakeTranscriber(error=RuntimeError("quota exceeded")))
+
+    await rig.say_command()
+
+    out = capsys.readouterr().out
+    assert "[voz] stt error: RuntimeError" in out
+    assert "[voz-debug] stt error RuntimeError: quota exceeded" in out
+
+
+async def test_debug_off_prints_no_diagnostic_lines(monkeypatch, capsys):
+    monkeypatch.delenv("VOICE_DEBUG", raising=False)
+    rig = Rig(FakeTranscriber(error=RuntimeError("quota exceeded")))
+
+    await rig.say_command()
+    out = capsys.readouterr().out
+
+    assert "[voz] stt error: RuntimeError" in out
+    assert "[voz-debug]" not in out
+    assert "quota exceeded" not in out
+
+
+class RaisingStdout:
+    def write(self, text):
+        raise UnicodeEncodeError("charmap", text, 0, 1, "character maps to <undefined>")
+
+    def flush(self):
+        pass
+
+
+def test_debug_emit_never_raises_when_stdout_fails(monkeypatch):
+    monkeypatch.setenv("VOICE_DEBUG", "1")
+    monkeypatch.setattr("sys.stdout", RaisingStdout())
+
+    debug.emit("transcript='ñandú'")
+
+
+async def test_stt_failure_still_notifies_when_debug_output_fails(monkeypatch):
+    monkeypatch.setenv("VOICE_DEBUG", "1")
+    rig = Rig(FakeTranscriber(error=RuntimeError("cuota ñ")))
+    monkeypatch.setattr("voice.debug.print", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("broken pipe")), raising=False)
+
+    await rig.say_command()
+
+    assert rig.notifier.texts == ["Te escucho, Maxi.", STT_FAILED]
+    assert rig.session.window.busy is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", " on "])
+def test_debug_helper_accepts_truthy_values(value):
+    assert debug.enabled({"VOICE_DEBUG": value}) is True
+
+
+@pytest.mark.parametrize("env", [{}, {"VOICE_DEBUG": "0"}, {"VOICE_DEBUG": "nope"}])
+def test_debug_helper_defaults_to_off(env):
+    assert debug.enabled(env) is False

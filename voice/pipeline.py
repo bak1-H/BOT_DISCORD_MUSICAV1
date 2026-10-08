@@ -4,7 +4,8 @@ import time
 
 from discord.ext.voice_recv import AudioSink
 
-from voice.audio import DEFAULT_RMS_THRESHOLD, Segmenter, to_mono_16k
+from voice import debug
+from voice.audio import BYTES_PER_SECOND, DEFAULT_RMS_THRESHOLD, Segmenter, to_mono_16k
 from voice.window import trailing_audio
 
 QUEUE_SIZE = 500
@@ -143,7 +144,12 @@ class ListeningPipeline:
         if hit is None:
             return
         self._close_segmenters()
-        session.trigger(user, trailing_audio(segment, hit.end_seconds))
+        tail = trailing_audio(segment, hit.end_seconds)
+        debug.emit(
+            f"wake phrase={hit.phrase!r} end={hit.end_seconds:.2f}s "
+            f"segment={len(segment) / BYTES_PER_SECOND:.2f}s tail={len(tail) / BYTES_PER_SECOND:.2f}s"
+        )
+        session.trigger(user, tail)
 
 
 class ActivationSink(AudioSink):

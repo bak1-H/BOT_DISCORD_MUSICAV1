@@ -5,6 +5,8 @@ import traceback
 
 from agent.listener import RATE_LIMITED
 from agent.trigger import fold_char
+from voice import debug
+from voice.audio import BYTES_PER_SECOND
 from voice.transcriber import to_wav
 from voice.window import CommandWindow, VoiceMessage
 
@@ -51,6 +53,7 @@ class VoiceCommandSession:
         self._transcriber = transcriber
         self._notifier = notifier
         self._stt_timeout_s = stt_timeout_s
+        self._clock = clock
         self._member = None
         self._tasks = set()
         self.window = CommandWindow(self._announce, self._dispatch, clock=clock, **window_options)
@@ -109,13 +112,17 @@ class VoiceCommandSession:
                 await self._say(RATE_LIMITED)
             return
         self._warned.discard(member.id)
+        debug.emit(f"stt audio={len(pcm) / BYTES_PER_SECOND:.2f}s")
+        started = self._clock()
         try:
             transcript = await asyncio.wait_for(self._transcriber.transcribe(to_wav(pcm)), self._stt_timeout_s)
         except Exception as error:
             print(f"[voz] stt error: {type(error).__name__}")
+            debug.emit(f"stt error {type(error).__name__}: {error}")
             await self._say(STT_FAILED)
             return
         request = strip_wake_phrase(transcript or "")
+        debug.emit(f"stt latency={int((self._clock() - started) * 1000)}ms transcript={transcript!r} request={request!r}")
         if not request:
             return
         message = VoiceMessage(
