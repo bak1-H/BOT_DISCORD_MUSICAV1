@@ -127,6 +127,16 @@ class AgentListener:
         text = extract_request(message, self._bot.user)
         if text is None:
             return
+        await self.handle_request(message, text)
+
+    def is_limited(self, user_id: int) -> bool:
+        return self._rate_limiter.limited(user_id)
+
+    def is_busy(self, guild_id: int) -> bool:
+        lock = self._guild_locks.get(guild_id)
+        return lock is not None and lock.locked()
+
+    async def handle_request(self, message, text: str) -> None:
         author_id = message.author.id
         if self._rate_limiter.limited(author_id):
             if self._rate_limiter.claim_warning(author_id):
