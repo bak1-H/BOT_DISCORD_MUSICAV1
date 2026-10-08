@@ -17,6 +17,11 @@ LOOP_MODES = ["off", "song", "queue"]
 MAX_QUEUE_SONGS_PER_CALL = 15
 
 
+def _stop_playback(client) -> None:
+    stop = getattr(client, "stop_playing", None) or client.stop
+    stop()
+
+
 @dataclass(frozen=True)
 class EnqueueResult:
     track: Track
@@ -297,7 +302,7 @@ class MusicService:
     def skip(self) -> bool:
         client = self.voice.client
         if client and client.is_playing():
-            client.stop()
+            _stop_playback(client)
             return True
         return False
 
@@ -320,7 +325,7 @@ class MusicService:
         async with self.player.voice_lock:
             client = self.voice.client
             if client:
-                client.stop()
+                _stop_playback(client)
                 if client.is_connected():
                     await client.disconnect()
 

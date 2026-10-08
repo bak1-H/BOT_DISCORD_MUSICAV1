@@ -11,6 +11,7 @@ from tests.fakes import (
     FakeAudioSource,
     FakeExtractor,
     FakeMember,
+    FakeRecvClient,
     FakeVoiceClient,
     FakeVoiceGateway,
     RecordingNotifier,
@@ -228,6 +229,31 @@ async def test_skip_stops_only_when_something_is_playing(tmp_path):
 
     assert (idle_result, playing_result) == (False, True)
     assert client.stop_calls == 1
+
+
+async def test_skip_on_a_listening_client_stops_playback_only(tmp_path):
+    client = FakeRecvClient()
+    client.playing = True
+    rig = build_service(tmp_path, client=client)
+
+    assert rig.service.skip() is True
+
+    assert client.stop_playing_calls == 1
+    assert client.stop_calls == 0
+    assert client.listening is True
+
+
+async def test_stop_on_a_listening_client_stops_playback_before_disconnecting(tmp_path):
+    client = FakeRecvClient()
+    client.playing = True
+    rig = build_service(tmp_path, client=client)
+
+    await rig.service.stop()
+
+    assert client.stop_playing_calls == 1
+    assert client.stop_calls == 0
+    assert client.listening is True
+    assert client.disconnect_calls == 1
 
 
 async def test_pause_and_resume_report_whether_they_acted(tmp_path):
