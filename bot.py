@@ -235,6 +235,27 @@ def describe_voice_state(activation, guild_id: int) -> str:
     return f"🎙️ Activación por voz: **{state}**. En este servidor: **{listening}**."
 
 
+LISTEN_UNAVAILABLE = "❌ La activación por voz no está habilitada en este servidor."
+LISTEN_OTHER_CHANNEL = "❌ Ya estoy en otro canal de voz. Usa `!salir` y vuelve a llamarme con `!listen` desde el tuyo."
+LISTEN_CONFIRMATION = "🎙️ Estoy en tu canal de voz escuchando la frase de activación. Usa `!salir` para que me vaya."
+
+
+def is_connected_elsewhere(service, channel) -> bool:
+    client = service.voice.client
+    return bool(client and client.is_connected() and client.channel != channel)
+
+
+@bot.command(name="listen", aliases=["escuchar"])
+async def listen(ctx):
+    activation = bot.voice_activation
+    if activation is None or not activation.enabled:
+        return await ctx.send(LISTEN_UNAVAILABLE)
+    if ctx.author.voice and is_connected_elsewhere(get_music_service(ctx.guild.id), ctx.author.voice.channel):
+        return await ctx.send(LISTEN_OTHER_CHANNEL)
+    if await connect_to_author_voice(ctx):
+        await ctx.send(LISTEN_CONFIRMATION)
+
+
 @bot.command(name="voz")
 async def voz(ctx, action: str = None):
     try:
@@ -433,6 +454,7 @@ async def comandos(ctx):
     embed.add_field(name="!skip", value="Salta la canción actual.", inline=False)
     embed.add_field(name="!stop", value="Detiene y desconecta el bot.", inline=False)
     embed.add_field(name="!salir / !leave", value="El bot sale del canal de voz.", inline=False)
+    embed.add_field(name="!listen / !escuchar", value="El bot entra a tu canal de voz a esperar la frase de activación.", inline=False)
     embed.add_field(name="!pause / !resume", value="Pausa o reanuda la reproducción.", inline=False)
     embed.add_field(name="!queue / !q", value="Muestra la cola de reproducción.", inline=False)
     embed.add_field(name="!np / !nowplaying", value="Muestra la canción actual.", inline=False)

@@ -28,9 +28,9 @@ def test_mentions_confirmation_flow():
 
 def test_lists_every_fallback_command():
     text = full_text()
-    for command in ("!play", "!skip", "!stop", "!salir", "!reiniciar", "!ayuda"):
+    for command in ("!play", "!skip", "!stop", "!salir", "!listen", "!reiniciar", "!ayuda"):
         assert command in text
-    assert help_content.FALLBACK_COMMANDS == ("!play", "!skip", "!stop", "!salir", "!reiniciar", "!ayuda")
+    assert help_content.FALLBACK_COMMANDS == ("!play", "!skip", "!stop", "!salir", "!listen", "!reiniciar", "!ayuda")
 
 
 def test_contains_example_phrases_for_each_capability():

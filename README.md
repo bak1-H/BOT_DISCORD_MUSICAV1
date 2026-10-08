@@ -18,6 +18,7 @@ Bot de música para Discord escrito en Python. Reproduce audio de YouTube en can
 | `!skip` | Salta la canción actual |
 | `!stop` | Detiene la reproducción, limpia la cola y desconecta el bot |
 | `!salir` / `!leave` | El bot sale del canal de voz (misma limpieza que `!stop`) |
+| `!listen` / `!escuchar` | Con la activación por voz encendida, el bot entra a tu canal de voz y espera la frase, sin buscar música |
 | `!voz on\|off\|estado` | Solo el dueño del bot: enciende o apaga la escucha por voz hasta el próximo reinicio |
 | `!pause` | Pausa la reproducción |
 | `!resume` | Reanuda la reproducción pausada |

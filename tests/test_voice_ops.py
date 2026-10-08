@@ -147,3 +147,113 @@ async def test_services_keep_alive_only_with_an_enabled_activation(isolated_bot)
 )
 def test_idle_minutes_come_from_the_environment_with_a_safe_default(isolated_bot, env, expected):
     assert isolated_bot.voice_idle_seconds(env) == expected
+
+
+class SpyService:
+    def __init__(self, connect_result=None, client=None):
+        from music.ports import ConnectResult
+
+        self.connect_result = connect_result or ConnectResult.CONNECTED
+        self.voice = SimpleNamespace(client=client)
+        self.calls = []
+
+    async def connect(self, channel, text_channel):
+        self.calls.append(("connect", channel, text_channel))
+        return self.connect_result
+
+    async def search_and_enqueue(self, query):
+        self.calls.append(("search_and_enqueue", query))
+
+    async def ensure_playing(self):
+        self.calls.append(("ensure_playing",))
+
+
+@pytest.fixture
+def spy_service(voice_bot, monkeypatch):
+    service = SpyService()
+    monkeypatch.setattr(voice_bot, "get_music_service", lambda guild_id: service)
+    return service
+
+
+async def test_listen_without_the_activation_says_so_and_does_nothing(voice_bot, spy_service):
+    ctx = FakeContext()
+
+    await voice_bot.listen.callback(ctx)
+
+    assert spy_service.calls == []
+    assert len(ctx.notifier.messages) == 1
+    assert ctx.notifier.has_text_containing("no está habilitada")
+
+
+async def test_listen_with_the_activation_off_says_so_and_does_nothing(voice_bot, spy_service):
+    voice_bot.bot.voice_activation = RecordingSwitch(enabled=False)
+    ctx = FakeContext()
+
+    await voice_bot.listen.callback(ctx)
+
+    assert spy_service.calls == []
+    assert ctx.notifier.has_text_containing("no está habilitada")
+
+
+async def test_listen_requires_the_author_in_a_voice_channel(voice_bot, spy_service):
+    voice_bot.bot.voice_activation = RecordingSwitch()
+    ctx = FakeContext(in_voice=False)
+
+    await voice_bot.listen.callback(ctx)
+
+    assert spy_service.calls == []
+    assert ctx.notifier.has_text_containing("Debes estar en un canal de voz")
+
+
+async def test_listen_joins_the_author_channel_without_touching_music(voice_bot, spy_service):
+    voice_bot.bot.voice_activation = RecordingSwitch()
+    ctx = FakeContext()
+
+    await voice_bot.listen.callback(ctx)
+
+    assert spy_service.calls == [("connect", ctx.voice_channel, ctx.channel)]
+    assert ctx.notifier.has_text_containing("escuchando la frase de activación")
+    assert ctx.notifier.has_text_containing("!salir")
+
+
+async def test_listen_reports_a_refused_connection_without_confirming(voice_bot, spy_service):
+    from music.ports import ConnectResult
+
+    voice_bot.bot.voice_activation = RecordingSwitch()
+    spy_service.connect_result = ConnectResult.REFUSED
+    ctx = FakeContext()
+
+    await voice_bot.listen.callback(ctx)
+
+    assert ctx.notifier.has_text_containing("No pude conectarme")
+    assert not ctx.notifier.has_text_containing("escuchando la frase")
+
+
+async def test_listen_when_already_connected_in_the_same_channel_is_idempotent(voice_bot, spy_service):
+    from music.ports import ConnectResult
+
+    voice_bot.bot.voice_activation = RecordingSwitch()
+    ctx = FakeContext()
+    spy_service.connect_result = ConnectResult.ALREADY_CONNECTED
+    spy_service.voice.client = FakeVoiceClient(ctx.voice_channel)
+
+    await voice_bot.listen.callback(ctx)
+    await voice_bot.listen.callback(ctx)
+
+    assert [call[0] for call in spy_service.calls] == ["connect", "connect"]
+    assert not ctx.notifier.has_text_containing("❌")
+
+
+async def test_listen_when_connected_in_another_channel_asks_to_move_the_bot(voice_bot, spy_service):
+    voice_bot.bot.voice_activation = RecordingSwitch()
+    ctx = FakeContext()
+    spy_service.voice.client = FakeVoiceClient(object())
+
+    await voice_bot.listen.callback(ctx)
+
+    assert spy_service.calls == []
+    assert ctx.notifier.has_text_containing("otro canal de voz")
+
+
+def test_listen_has_the_escuchar_alias(isolated_bot):
+    assert isolated_bot.bot.get_command("escuchar") is isolated_bot.listen
