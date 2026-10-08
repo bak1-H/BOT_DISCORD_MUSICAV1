@@ -8,6 +8,9 @@ from dataclasses import dataclass
 import yt_dlp
 
 YT_CLIENTS = ["web", "android_vr", "android", "ios"]
+DEFAULT_CLIENT = None
+DEFAULT_CLIENT_LABEL = "default"
+DOWNLOAD_ATTEMPTS = [DEFAULT_CLIENT, *YT_CLIENTS]
 DOWNLOAD_SOCKET_TIMEOUT_S = 30
 VIDEO_ID_PATTERN = re.compile(r"(?:[?&]v=|youtu\.be/)([A-Za-z0-9_-]+)")
 
@@ -49,11 +52,13 @@ def is_youtube_login_block(err: Exception) -> bool:
     ))
 
 
-def build_ytdlp_opts(settings: YtdlpSettings, is_search: bool, client: str = "web", search_count: int = 1) -> dict:
+def build_ytdlp_opts(settings: YtdlpSettings, is_search: bool, client: str | None = "web", search_count: int = 1) -> dict:
     opts = copy.deepcopy(base_ytdlp_options(settings))
-    yt_args: dict = {"player_client": [client]}
-    if settings.po_token:
-        yt_args["po_token"] = [f"{client}+{settings.po_token}"]
+    yt_args: dict = {}
+    if client is not None:
+        yt_args["player_client"] = [client]
+        if settings.po_token:
+            yt_args["po_token"] = [f"{client}+{settings.po_token}"]
     if settings.visitor_data:
         yt_args["visitor_data"] = [settings.visitor_data]
     opts["extractor_args"] = {"youtube": yt_args}
@@ -76,7 +81,7 @@ async def ytdlp_extract(
     return await loop.run_in_executor(None, _extract)
 
 
-def build_download_opts(settings: YtdlpSettings, download_dir: str, gid: int, client: str) -> dict:
+def build_download_opts(settings: YtdlpSettings, download_dir: str, gid: int, client: str | None) -> dict:
     opts = build_ytdlp_opts(settings, is_search=False, client=client)
     opts["format"] = "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/bestaudio/best"
     opts["outtmpl"] = os.path.join(download_dir, f"{gid}_%(id)s.%(ext)s")
@@ -101,7 +106,7 @@ async def download_audio_with_fallback(
 ) -> tuple[dict, str, str]:
     loop = asyncio.get_running_loop()
     last_error = None
-    for client in YT_CLIENTS:
+    for client in DOWNLOAD_ATTEMPTS:
         opts = build_download_opts(settings, download_dir, gid, client)
 
         def _download():
@@ -114,7 +119,7 @@ async def download_audio_with_fallback(
         try:
             info, path = await loop.run_in_executor(None, _download)
             if os.path.exists(path):
-                return info, path, client
+                return info, path, client or DEFAULT_CLIENT_LABEL
         except Exception as e:
             last_error = e
     if last_error:

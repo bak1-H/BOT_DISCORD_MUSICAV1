@@ -121,7 +121,7 @@ class FakeYoutubeDL:
 
     def __init__(self, opts):
         self.opts = opts
-        self.client = opts["extractor_args"]["youtube"]["player_client"][0]
+        self.client = opts["extractor_args"]["youtube"].get("player_client", [None])[0]
         FakeYoutubeDL.instances.append(self)
 
     def __enter__(self):
@@ -150,27 +150,49 @@ def fake_youtube_dl(monkeypatch):
     return FakeYoutubeDL
 
 
-async def test_download_uses_first_client_and_injected_directory(fake_youtube_dl, tmp_path):
+async def test_download_uses_default_selection_first_and_injected_directory(fake_youtube_dl, tmp_path):
     info, path, client = await ytdl.download_audio_with_fallback(ytdl.YtdlpSettings(), str(tmp_path), 5, "https://u")
 
-    assert client == "web"
+    assert client == "default"
+    assert [i.client for i in fake_youtube_dl.instances] == [None]
     assert info["id"] == "vid"
     assert path == os.path.join(str(tmp_path), "5_vid.webm")
     assert os.path.exists(path)
 
 
 async def test_download_falls_back_to_next_client(fake_youtube_dl, tmp_path):
-    fake_youtube_dl.failing_clients = {"web", "android_vr"}
+    fake_youtube_dl.failing_clients = {None, "web", "android_vr"}
 
     _, path, client = await ytdl.download_audio_with_fallback(ytdl.YtdlpSettings(), str(tmp_path), 5, "https://u")
 
     assert client == "android"
-    assert [i.client for i in fake_youtube_dl.instances] == ["web", "android_vr", "android"]
+    assert [i.client for i in fake_youtube_dl.instances] == [None, "web", "android_vr", "android"]
     assert path.startswith(str(tmp_path))
 
 
+async def test_download_tries_every_forced_client_in_order_after_default(fake_youtube_dl, tmp_path):
+    fake_youtube_dl.failing_clients = {None}
+
+    _, _, client = await ytdl.download_audio_with_fallback(ytdl.YtdlpSettings(), str(tmp_path), 5, "https://u")
+
+    assert client == "web"
+    assert ytdl.DOWNLOAD_ATTEMPTS == [None, "web", "android_vr", "android", "ios"]
+
+
+def test_default_download_options_omit_player_client_but_keep_the_rest():
+    settings = ytdl.YtdlpSettings(po_token="PO", visitor_data="VD")
+
+    default_opts = ytdl.build_download_opts(settings, "dl", 5, ytdl.DEFAULT_CLIENT)
+    forced_opts = ytdl.build_download_opts(settings, "dl", 5, "ios")
+
+    assert default_opts["extractor_args"] == {"youtube": {"visitor_data": ["VD"]}}
+    assert default_opts["socket_timeout"] == 30
+    assert forced_opts["extractor_args"]["youtube"]["player_client"] == ["ios"]
+    assert forced_opts["extractor_args"]["youtube"]["po_token"] == ["ios+PO"]
+
+
 async def test_download_raises_last_error_when_every_client_fails(fake_youtube_dl, tmp_path):
-    fake_youtube_dl.failing_clients = set(ytdl.YT_CLIENTS)
+    fake_youtube_dl.failing_clients = set(ytdl.DOWNLOAD_ATTEMPTS)
 
     with pytest.raises(RuntimeError, match="ios failed"):
         await ytdl.download_audio_with_fallback(ytdl.YtdlpSettings(), str(tmp_path), 5, "https://u")
@@ -200,7 +222,7 @@ async def test_cancelling_the_download_stops_trying_further_clients(fake_youtube
         await task
     await asyncio.sleep(0.05)
 
-    assert [i.client for i in fake_youtube_dl.instances] == ["web"]
+    assert [i.client for i in fake_youtube_dl.instances] == [None]
 
 
 @pytest.mark.parametrize(
