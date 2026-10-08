@@ -39,6 +39,14 @@ def test_contains_example_phrases_for_each_capability():
         assert fragment in text
 
 
+def test_describes_every_agent_capability_and_text_command():
+    text = full_text().lower()
+    for fragment in ("pausar", "loop", "radio", "playlists", "letra", "league of legends", "salir del canal", "volumen"):
+        assert fragment in text
+    for command in ("!pause", "!resume", "!queue", "!np", "!lyrics", "!radio", "!dj", "!clear", "!repo", "!comandos", "!voz"):
+        assert command in text
+
+
 def test_repo_url_is_in_help_text():
     assert help_content.REPO_URL == "https://github.com/bak1-H/BOT_DISCORD_MUSICA"
     assert help_content.REPO_URL in full_text()

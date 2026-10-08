@@ -1,5 +1,6 @@
 import help_content
-from agent.prompt import build_system_prompt, build_turn_prompt
+from agent.prompt import UNCLEAR_REQUEST_REPLY, VOICE_INPUT_HINT, build_system_prompt, build_turn_prompt
+from agent.tools import build_registry
 from tests.agent_support import build_rig, fill_queue
 
 VOSEO_FORMS = ("podés", "tenés", "querés", "necesitás", "pedí", "elegí", "tené", "revisá", "acá", "dale ")
@@ -123,7 +124,7 @@ async def test_voice_turn_prompt_adds_the_speech_hint_before_the_context(tmp_pat
 
     assert prompt.startswith("<voice_input>")
     assert prompt.endswith("<user_message>\nskipea esta\n</user_message>")
-    for expected in ("reconocimiento de voz", "chileno", "skipea", "la raja", "un tema de X", "a la cola", "pedido claro"):
+    for expected in ("reconocimiento de voz", "chileno", "skipea", "la raja", "un tema de X", "a la cola", "pedidos claros"):
         assert expected in prompt
 
 
@@ -172,6 +173,50 @@ async def test_voice_hint_has_no_voseo(tmp_path):
 
     for form in VOSEO_FORMS:
         assert form not in prompt
+
+
+def test_unclear_request_reply_is_the_fixed_phrase():
+    assert UNCLEAR_REQUEST_REPLY == "No entendí bien lo que me pides, ¿puedes repetirlo?"
+
+
+def test_unclear_request_reply_is_in_both_system_prompt_and_voice_hint():
+    assert UNCLEAR_REQUEST_REPLY in build_system_prompt()
+    assert UNCLEAR_REQUEST_REPLY in VOICE_INPUT_HINT
+
+
+def test_system_prompt_has_the_three_case_decision_section():
+    prompt = build_system_prompt()
+
+    assert "# Cómo decidir qué hacer" in prompt
+    assert "SIN herramientas" in prompt
+    assert "600 caracteres" in prompt
+    assert "nunca inventes" in prompt
+    assert "NO adivines" in prompt
+    assert "responde exactamente" in prompt
+    assert "conversar y responder preguntas generales" in prompt
+
+
+def test_system_prompt_states_playback_starts_in_background_without_claiming_success():
+    prompt = build_system_prompt()
+
+    assert "en segundo plano" in prompt
+    assert "Poniendo X" in prompt
+    assert "Nunca digas que ya está sonando" in prompt
+
+
+def test_voice_hint_answers_questions_instead_of_asking_to_repeat_everything():
+    assert "pidiendo que lo repita" not in VOICE_INPUT_HINT
+    assert "no trata de ti ni de la música" in VOICE_INPUT_HINT
+    assert "sin herramientas" in VOICE_INPUT_HINT
+    assert "responde exactamente" in VOICE_INPUT_HINT
+
+
+def test_every_registered_tool_has_a_description():
+    schemas = build_registry().schemas()
+
+    assert schemas
+    for schema in schemas:
+        assert schema["description"].strip()
 
 
 async def test_voice_hint_maps_leaving_to_the_tool_instead_of_a_confirmation(tmp_path):

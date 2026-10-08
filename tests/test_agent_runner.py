@@ -86,6 +86,17 @@ async def test_capability_question_is_answered_from_prompt_with_zero_tool_calls(
     assert reply.text == "Puedo reproducir, hacer cola y más."
 
 
+async def test_plain_chat_turn_returns_the_model_text_with_one_model_call_and_no_tools(tmp_path):
+    rig = build_rig(tmp_path)
+    model = ScriptedChatModel(ai_text("París es la capital de Francia."))
+
+    reply = await make_runner(model).run(rig.ctx, "¿cuál es la capital de Francia?")
+
+    assert reply.text == "París es la capital de Francia."
+    assert rig.ctx.ledger.tool_calls == 0
+    assert len(model.calls) == 1
+
+
 async def test_voice_turn_uses_the_same_number_of_model_calls_as_a_text_turn(tmp_path):
     counts = {}
     for by_voice in (False, True):
