@@ -5,6 +5,8 @@ from collections import deque
 import discord
 from langchain_core.messages import AIMessage
 
+from music import ytdl
+
 
 class FakeAudioSource:
     def __init__(self, path, **options):
@@ -203,6 +205,7 @@ class FakeExtractor:
         self.search_calls = []
         self.download_outcomes = deque()
         self.download_calls = []
+        self.discard_calls = []
 
     @staticmethod
     def entry(video_id, title=None, duration=200, **extra):
@@ -230,6 +233,10 @@ class FakeExtractor:
 
     async def download(self, guild_id, url):
         return await self.download_audio_with_fallback(guild_id, url)
+
+    def discard_download(self, guild_id, url):
+        self.discard_calls.append(url)
+        ytdl.discard_download_leftovers(self.download_dir, guild_id, url)
 
     async def download_audio_with_fallback(self, gid, url):
         self.download_calls.append(url)

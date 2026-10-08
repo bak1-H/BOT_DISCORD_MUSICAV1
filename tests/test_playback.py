@@ -315,7 +315,7 @@ async def test_three_consecutive_failures_clear_queue_and_disconnect(isolated_bo
     assert ctx.voice_client.disconnect_calls == 1
     assert len(patch_extractor.download_calls) == 3
     assert isolated_bot.players.get(GID).fail_count == 3
-    error_messages = [t for t in ctx.notifier.texts if "Error al reproducir" in t]
+    error_messages = [t for t in ctx.notifier.texts if "No pude descargar" in t]
     assert len(error_messages) == 1
     assert ctx.notifier.has_text_containing("Falló la reproducción varias veces")
 
@@ -357,7 +357,7 @@ async def test_already_playing_error_aborts_without_counting_or_retrying(isolate
     assert isolated_bot.players.get(GID).fail_count == 0
     assert patch_extractor.download_calls == ["https://www.youtube.com/watch?v=a"]
     assert queued_pairs(isolated_bot, GID) == [("https://www.youtube.com/watch?v=b", "Song b")]
-    assert not ctx.notifier.has_text_containing("Error al reproducir")
+    assert not ctx.notifier.has_text_containing("No pude descargar")
 
 
 async def test_playback_aborts_and_cleans_file_when_voice_disconnected_during_download(isolated_bot, patch_extractor, ctx):

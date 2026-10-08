@@ -13,3 +13,6 @@ class YtdlpExtractor:
 
     async def download(self, guild_id: int, url: str) -> tuple[dict, str, str]:
         return await ytdl.download_audio_with_fallback(self._settings, self._download_dir, guild_id, url)
+
+    def discard_download(self, guild_id: int, url: str) -> None:
+        ytdl.discard_download_leftovers(self._download_dir, guild_id, url)

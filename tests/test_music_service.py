@@ -6,7 +6,7 @@ import pytest
 
 from music.player import GuildPlayer
 from music.ports import ConnectResult
-from music.service import MusicService
+from music.service import DEFAULT_DOWNLOAD_TIMEOUT_S, MusicService, download_timeout_from_env
 from tests.fakes import (
     FakeAudioSource,
     FakeExtractor,
@@ -169,8 +169,110 @@ async def test_failures_notify_once_then_clear_queue_and_disconnect(tmp_path):
 
     assert rig.player.queue == []
     assert rig.voice.client.disconnect_calls == 1
-    assert len([t for t in rig.notifier.texts if "Error al reproducir" in t]) == 1
+    assert len([t for t in rig.notifier.texts if "No pude descargar" in t]) == 1
     assert rig.notifier.has_text_containing("Falló la reproducción varias veces")
+
+
+async def test_a_failed_download_names_the_song_without_leaking_the_error_text(tmp_path):
+    rig = build_service(tmp_path, client=FakeVoiceClient())
+    queue_songs(rig.player, "a", "b")
+    rig.extractor.download_outcomes.append(RuntimeError("Requested format is not available https://secret.example/v"))
+
+    await rig.service._play_next_locked()
+
+    assert [t for t in rig.notifier.texts if "No pude descargar" in t] == ["❌ No pude descargar «Song a»."]
+    assert not rig.notifier.has_text_containing("secret.example")
+    assert rig.player.current["title"] == "Song b"
+    assert rig.voice.client.play_calls == 1
+
+
+async def test_a_hung_download_times_out_releases_the_lock_and_plays_the_next_song(tmp_path, monkeypatch):
+    monkeypatch.setenv("MUSIC_DOWNLOAD_TIMEOUT_S", "0.05")
+    rig = build_service(tmp_path, client=FakeVoiceClient())
+    queue_songs(rig.player, "a", "b")
+    leftover = tmp_path / f"{GID}_a.webm.part"
+    leftover.write_bytes(b"partial")
+    other_song = tmp_path / f"{GID}_ab.webm"
+    other_song.write_bytes(b"other")
+    other_guild = tmp_path / "2_a.webm"
+    other_guild.write_bytes(b"other")
+    original = rig.extractor.download
+    hung = []
+
+    async def hang_once(guild_id, url):
+        if not hung:
+            hung.append(url)
+            await asyncio.Event().wait()
+        return await original(guild_id, url)
+
+    rig.extractor.download = hang_once
+
+    await asyncio.wait_for(rig.service.ensure_playing(), 3)
+
+    assert hung == ["https://www.youtube.com/watch?v=a"]
+    assert rig.notifier.has_text_containing("No pude descargar «Song a»")
+    assert not rig.player.playback_lock.locked()
+    assert rig.player.current["title"] == "Song b"
+    assert rig.player.audio_file == str(tmp_path / f"{GID}_b.webm")
+    assert rig.player.fail_count == 0
+    assert not leftover.exists()
+    assert other_song.exists()
+    assert other_guild.exists()
+    assert rig.extractor.discard_calls == ["https://www.youtube.com/watch?v=a"]
+
+
+async def test_a_failed_non_timeout_download_does_not_discard_files(tmp_path):
+    rig = build_service(tmp_path, client=FakeVoiceClient())
+    queue_songs(rig.player, "a", "b")
+    rig.extractor.download_outcomes.append(RuntimeError("boom"))
+
+    await rig.service._play_next_locked()
+
+    assert rig.extractor.discard_calls == []
+
+
+async def test_a_player_error_is_reported_as_playback_not_download(tmp_path):
+    rig = build_service(tmp_path, client=FakeVoiceClient())
+    queue_songs(rig.player, "a", "b")
+    calls = []
+
+    def failing_once(path):
+        calls.append(path)
+        if len(calls) == 1:
+            raise RuntimeError("ffmpeg secret.example exploded")
+        return FakeAudioSource(path, options="-vn")
+
+    rig.service.audio_source_factory = failing_once
+
+    await rig.service._play_next_locked()
+
+    assert rig.notifier.texts.count("❌ No pude reproducir «Song a».") == 1
+    assert not rig.notifier.has_text_containing("No pude descargar")
+    assert not rig.notifier.has_text_containing("secret.example")
+    assert rig.player.current["title"] == "Song b"
+
+
+async def test_a_youtube_login_block_sends_only_the_blocked_notice(tmp_path):
+    rig = build_service(tmp_path, client=FakeVoiceClient())
+    queue_songs(rig.player, "a", "b")
+    rig.extractor.download_outcomes.append(RuntimeError("Sign in to confirm you're not a bot"))
+
+    await rig.service._play_next_locked()
+
+    assert not rig.notifier.has_text_containing("No pude")
+    assert rig.notifier.has_text_containing("bloqueado por YouTube")
+    assert rig.player.current["title"] == "Song b"
+
+
+@pytest.mark.parametrize("raw", [None, "", "abc", "0", "-5", "nan", "inf"])
+def test_download_timeout_falls_back_to_the_default_when_invalid(raw):
+    env = {} if raw is None else {"MUSIC_DOWNLOAD_TIMEOUT_S": raw}
+
+    assert download_timeout_from_env(env) == DEFAULT_DOWNLOAD_TIMEOUT_S == 180.0
+
+
+def test_download_timeout_reads_a_positive_value_from_the_environment():
+    assert download_timeout_from_env({"MUSIC_DOWNLOAD_TIMEOUT_S": " 45.5 "}) == 45.5
 
 
 async def test_search_and_enqueue_adds_normalized_track_and_reports_idle(tmp_path):

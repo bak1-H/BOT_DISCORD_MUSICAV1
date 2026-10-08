@@ -1,11 +1,15 @@
 import asyncio
 import copy
+import glob
 import os
+import re
 from dataclasses import dataclass
 
 import yt_dlp
 
 YT_CLIENTS = ["web", "android_vr", "android", "ios"]
+DOWNLOAD_SOCKET_TIMEOUT_S = 30
+VIDEO_ID_PATTERN = re.compile(r"(?:[?&]v=|youtu\.be/)([A-Za-z0-9_-]+)")
 
 
 @dataclass(frozen=True)
@@ -76,7 +80,20 @@ def build_download_opts(settings: YtdlpSettings, download_dir: str, gid: int, cl
     opts = build_ytdlp_opts(settings, is_search=False, client=client)
     opts["format"] = "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/bestaudio/best"
     opts["outtmpl"] = os.path.join(download_dir, f"{gid}_%(id)s.%(ext)s")
+    opts["socket_timeout"] = DOWNLOAD_SOCKET_TIMEOUT_S
     return opts
+
+
+def discard_download_leftovers(download_dir: str, gid: int, url: str | None) -> None:
+    match = VIDEO_ID_PATTERN.search(url or "")
+    if not match:
+        return
+    pattern = os.path.join(glob.escape(download_dir), f"{gid}_{glob.escape(match.group(1))}.*")
+    for path in glob.glob(pattern):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 async def download_audio_with_fallback(

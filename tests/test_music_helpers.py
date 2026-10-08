@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import threading
 from pathlib import Path
 
 import discord
@@ -173,6 +174,69 @@ async def test_download_raises_last_error_when_every_client_fails(fake_youtube_d
 
     with pytest.raises(RuntimeError, match="ios failed"):
         await ytdl.download_audio_with_fallback(ytdl.YtdlpSettings(), str(tmp_path), 5, "https://u")
+
+
+def test_download_options_set_a_socket_timeout():
+    opts = ytdl.build_download_opts(ytdl.YtdlpSettings(), "dl", 5, "web")
+
+    assert opts["socket_timeout"] == ytdl.DOWNLOAD_SOCKET_TIMEOUT_S == 30
+
+
+async def test_cancelling_the_download_stops_trying_further_clients(fake_youtube_dl, tmp_path, monkeypatch):
+    release = threading.Event()
+
+    def blocking_extract(self, url, download):
+        release.wait(timeout=5)
+        raise RuntimeError("late failure")
+
+    monkeypatch.setattr(FakeYoutubeDL, "extract_info", blocking_extract)
+    task = asyncio.ensure_future(
+        ytdl.download_audio_with_fallback(ytdl.YtdlpSettings(), str(tmp_path), 5, "https://u")
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.05)
+
+    assert [i.client for i in fake_youtube_dl.instances] == ["web"]
+
+
+@pytest.mark.parametrize(
+    "url, removed",
+    [
+        ("https://www.youtube.com/watch?v=abc_-1", True),
+        ("https://youtu.be/abc_-1", True),
+        ("https://www.youtube.com/watch?v=abc_-1&t=3", True),
+        ("https://example.com/video", False),
+        (None, False),
+    ],
+)
+def test_discard_download_leftovers_removes_only_files_of_that_guild_and_video(tmp_path, url, removed):
+    target = tmp_path / "5_abc_-1.webm.part"
+    target.write_bytes(b"x")
+    same_prefix = tmp_path / "5_abc_-12.webm"
+    same_prefix.write_bytes(b"x")
+    other_guild = tmp_path / "6_abc_-1.webm"
+    other_guild.write_bytes(b"x")
+
+    ytdl.discard_download_leftovers(str(tmp_path), 5, url)
+
+    assert target.exists() is (not removed)
+    assert same_prefix.exists()
+    assert other_guild.exists()
+
+
+def test_discard_download_leftovers_swallows_filesystem_errors(tmp_path, monkeypatch):
+    (tmp_path / "5_abc.webm").write_bytes(b"x")
+
+    def refuse(path):
+        raise PermissionError("in use")
+
+    monkeypatch.setattr(ytdl.os, "remove", refuse)
+
+    ytdl.discard_download_leftovers(str(tmp_path), 5, "https://www.youtube.com/watch?v=abc")
 
 
 def test_playable_candidate_filters_live_long_and_excluded():

@@ -1,4 +1,6 @@
 import asyncio
+import math
+import os
 import traceback
 from dataclasses import dataclass, field
 from enum import Enum
@@ -17,6 +19,16 @@ IDLE_TIMEOUT = 900
 LOOP_MODES = ["off", "song", "queue"]
 MAX_QUEUE_SONGS_PER_CALL = 15
 MAX_LOGGED_ERROR_CHARS = 300
+DEFAULT_DOWNLOAD_TIMEOUT_S = 180.0
+
+
+def download_timeout_from_env(env=None):
+    source = os.environ if env is None else env
+    try:
+        value = float((source.get("MUSIC_DOWNLOAD_TIMEOUT_S") or "").strip())
+    except ValueError:
+        return DEFAULT_DOWNLOAD_TIMEOUT_S
+    return value if math.isfinite(value) and value > 0 else DEFAULT_DOWNLOAD_TIMEOUT_S
 
 
 def _stop_playback(client) -> None:
@@ -76,6 +88,7 @@ class MusicService:
         self._sleep = sleep
         self._idle_task: asyncio.Task | None = None
         self._stopping = False
+        self._download_timeout_s = download_timeout_from_env()
 
     async def connect(self, channel, text_channel) -> ConnectResult:
         async with self.player.voice_lock:
@@ -265,8 +278,19 @@ class MusicService:
         queued_title = track.title
         url = normalize_youtube_url(track.url)
 
+        download_failed = False
         try:
-            info, audio_path, _ = await self.extractor.download(gid, url)
+            try:
+                info, audio_path, _ = await asyncio.wait_for(
+                    self.extractor.download(gid, url), self._download_timeout_s
+                )
+            except asyncio.TimeoutError:
+                download_failed = True
+                self.extractor.discard_download(gid, url)
+                raise TimeoutError(f"la descarga superó {self._download_timeout_s:g}s") from None
+            except Exception:
+                download_failed = True
+                raise
 
             song = {
                 "title": info.get("title", queued_title),
@@ -300,10 +324,12 @@ class MusicService:
             traceback.print_exc()
             print(f"Play error: {e}")
 
-            if player.fail_count == 1:
-                await self.notifier.send(f"❌ Error al reproducir: {e}")
+            login_block = is_youtube_login_block(e)
+            if player.fail_count == 1 and not login_block:
+                verb = "descargar" if download_failed else "reproducir"
+                await self.notifier.send(f"❌ No pude {verb} «{queued_title}».")
 
-            if is_youtube_login_block(e):
+            if login_block:
                 await self.notifier.send(f"⚠️ `{queued_title}` bloqueado por YouTube desde este servidor. Saltando.")
                 player.fail_count = 0
                 await self._play_next_locked()

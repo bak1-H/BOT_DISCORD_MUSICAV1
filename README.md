@@ -55,6 +55,7 @@ Variables opcionales:
 | `PORT` | Puerto del health check HTTP (por defecto `8080`) |
 | `VOICE_ACTIVATION_ENABLED` | Enciende la activación por voz ("maca quino ..."); con ella el bot no sale al terminar la cola y espera la frase. Apagada por defecto |
 | `VOICE_IDLE_MINUTES` | Con la activación por voz, minutos sin música antes de que el bot salga del canal (por defecto `15`) |
+| `MUSIC_DOWNLOAD_TIMEOUT_S` | Segundos máximos para descargar una canción antes de saltarla (por defecto `180`) |
 
 Con la activación por voz encendida, el bot se queda en el canal al terminar la cola y sale con `!salir`, pidiéndoselo por voz o tras `VOICE_IDLE_MINUTES` sin música; `!voz off` es un interruptor en caliente que no se guarda, así que al reiniciar manda `VOICE_ACTIVATION_ENABLED`.
 
