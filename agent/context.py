@@ -63,3 +63,4 @@ class RunContext:
     lyrics: LyricsPort | None = None
     lol: LolPort | None = None
     ledger: TurnLedger = field(default_factory=TurnLedger)
+    by_voice: bool = False

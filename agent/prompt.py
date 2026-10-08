@@ -35,6 +35,23 @@ def render_help_block() -> str:
     return "\n\n".join(sections)
 
 
+VOICE_INPUT_HINT = """<voice_input>
+El mensaje llegó por voz y se transcribió con reconocimiento de voz: puede tener errores, faltar puntuación o traer palabras cortadas porque se pierden fragmentos de audio. Interpreta la intención con tolerancia.
+Quien habla usa español chileno coloquial. Equivalencias para controlar la música:
+- "skipea", "pasa", "salta" esta = saltar la canción actual (skip).
+- "pon", "ponle", "mete" + tema = reproducir ese tema.
+- "agrega", "echa" + tema "a la cola" = agregarlo al final de la cola, sin cortar lo que suena.
+- "un tema de X" = una sola canción de X, no una playlist ni una radio.
+- "esta canción" o "este tema" = la canción actual.
+- "para", "pausa" = pausar; "sigue", "continúa" = reanudar.
+- "la raja", "filete", "brutal", "está buenísima" son elogios, no pedidos: no hagas nada con ellos.
+- "sube" o "baja" (volumen) no se puede hacer: dilo en una frase.
+- Pedidos destructivos o ambiguos oídos por voz (borrar la cola o una playlist, parar todo, salir del canal): no asumas que entendiste bien. No uses herramientas; responde pidiendo que lo confirme con el botón o que lo repita con claridad.
+Actúa directamente solo ante pedidos claros de control de música que no sean destructivos. Si no es un pedido claro, no uses herramientas y responde una sola frase corta pidiendo que lo repita.
+</voice_input>
+"""
+
+
 def build_system_prompt() -> str:
     commands = ", ".join(help_content.FALLBACK_COMMANDS)
     return (
@@ -59,7 +76,8 @@ def build_turn_prompt(ctx: RunContext, user_text: str) -> str:
         f"- loop: {player.loop_mode}"
     )
     message = strip_prompt_tags(user_text)[:MAX_USER_TEXT]
+    hint = VOICE_INPUT_HINT if ctx.by_voice else ""
     return (
-        f"<runtime_context>\n{runtime}\n</runtime_context>\n"
+        f"{hint}<runtime_context>\n{runtime}\n</runtime_context>\n"
         f"<user_message>\n{message}\n</user_message>"
     )

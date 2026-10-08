@@ -28,6 +28,7 @@ class VoiceMessage:
     channel: object
     mentions: list = field(default_factory=list)
     reference: object = None
+    by_voice: bool = True
 
     async def reply(self, content=None, **kwargs):
         return await self.channel.send(content, **kwargs)
