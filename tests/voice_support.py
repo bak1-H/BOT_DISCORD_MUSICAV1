@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 import struct
@@ -39,6 +40,22 @@ def feed_frames(segmenter, clock, pcm):
         if segment:
             segments.append(segment)
     return segments
+
+
+class FakeTranscriber:
+    def __init__(self, text="", error=None, hang=False):
+        self.text = text
+        self.error = error
+        self.hang = hang
+        self.calls = []
+
+    async def transcribe(self, wav_bytes):
+        self.calls.append(wav_bytes)
+        if self.hang:
+            await asyncio.Event().wait()
+        if self.error is not None:
+            raise self.error
+        return self.text
 
 
 class FakeRecognizer:
