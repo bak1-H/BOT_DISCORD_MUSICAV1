@@ -35,6 +35,11 @@ MAX_ERROR_CHARS = 300
 IGNORED_ID_FIELDS = frozenset({"guild_id", "user_id", "channel_id", "author_id", "voice_channel_id", "member_id"})
 SCHEMA_KEYS_TO_DROP = frozenset({"title", "additionalProperties", "default"})
 
+MAX_LOGGED_PLAYBACK_ERROR_CHARS = 120
+NO_CONTROL_AFTER_PLAYBACK = (
+    "Tras iniciar la reproducción con esta herramienta, no llames a skip, pause ni resume en el mismo turno."
+)
+PLAYBACK_START_FAILED ="❌ No pude iniciar la reproducción."
 NOT_IN_VOICE = "Entra a un canal de voz primero."
 NO_PLAYLIST_STORE = "Las playlists no están disponibles en este momento."
 NO_LOL_SERVICE = "La consulta de LoL no está disponible en este momento."
@@ -260,6 +265,27 @@ async def show_playlist(ctx, args):
     return ToolOutcome(f"Playlist {quoted(name)} ({len(songs)} canciones):\n" + "\n".join(lines))
 
 
+background_playback = set()
+
+
+async def run_playback(music):
+    try:
+        await music.ensure_playing()
+    except Exception as error:
+        detail = " ".join(str(error).split())[:MAX_LOGGED_PLAYBACK_ERROR_CHARS]
+        print(f"[agente] error al iniciar la reproducción: {type(error).__name__}: {detail}")
+        try:
+            await music.notifier.send(PLAYBACK_START_FAILED)
+        except Exception:
+            pass
+
+
+def start_playback_in_background(music):
+    task = asyncio.create_task(run_playback(music))
+    background_playback.add(task)
+    task.add_done_callback(background_playback.discard)
+
+
 async def play_song(ctx, args):
     problem = await ensure_voice(ctx)
     if problem:
@@ -270,23 +296,24 @@ async def play_song(ctx, args):
         return failure("No encontré resultados para esa búsqueda.")
     title = quoted(result.track.title)
     position = music.player.queue.index(result.track) + 1 if result.track in music.player.queue else None
-    await music.ensure_playing()
+    start_playback_in_background(music)
     if result.busy and position is not None:
         return ToolOutcome(f"Añadida a la cola (#{position}): {title}")
-    return ToolOutcome(f"Reproduciendo: {title}")
+    return ToolOutcome(f"Preparando para reproducir: {title}")
 
 
 async def play_next(ctx, args):
     problem = await ensure_voice(ctx)
     if problem:
         return failure(problem)
-    result = await ctx.music.enqueue_next(args.query)
+    result = await ctx.music.enqueue_next(args.query, start_playback=False)
     if result is None:
         return failure("No encontré resultados para esa búsqueda.")
+    start_playback_in_background(ctx.music)
     title = quoted(result.track.title)
     if result.busy:
         return ToolOutcome(f"Sonará después de la actual: {title}")
-    return ToolOutcome(f"Reproduciendo: {title}")
+    return ToolOutcome(f"Preparando para reproducir: {title}")
 
 
 async def queue_songs(ctx, args):
@@ -299,7 +326,9 @@ async def queue_songs(ctx, args):
     over_budget = len(args.songs) - len(accepted)
     if not accepted:
         return failure("Ya alcancé el máximo de canciones por pedido.")
-    result = await ctx.music.queue_songs(accepted, args.max_duration_s)
+    result = await ctx.music.queue_songs(accepted, args.max_duration_s, start_playback=False)
+    if result.queued:
+        start_playback_in_background(ctx.music)
     ledger.songs_queued += len(accepted) - result.skipped_over_limit
     parts = [f"Encolé {len(result.queued)} canciones."]
     omitted = result.skipped_over_limit + over_budget
@@ -342,7 +371,7 @@ async def start_radio(ctx, args):
     music = ctx.music
     music.start_radio(args.theme)
     if await music.radio_next():
-        await music.ensure_playing()
+        start_playback_in_background(music)
         return ToolOutcome(f"Radio activada: {clean_text(args.theme)}.")
     music.stop_radio()
     return failure("No encontré canciones para ese estilo.")
@@ -455,7 +484,7 @@ async def playlist_load(ctx, args):
         return failure(problem)
     for entry in songs:
         ctx.music.player.enqueue(entry["url"], entry["title"])
-    await ctx.music.ensure_playing()
+    start_playback_in_background(ctx.music)
     return ToolOutcome(f"Playlist {quoted(name)} cargada: {len(songs)} canciones.")
 
 
@@ -710,9 +739,24 @@ def build_registry() -> ToolRegistry:
         ToolSpec("show_playlist", "Muestra las canciones de una playlist.", NameArgs, show_playlist, read_only=True),
         ToolSpec("lol_summoner", "Consulta nivel y rango de League of Legends de un invocador por Riot ID (Nombre#TAG).", RiotIdArgs, lol_summoner, read_only=True),
         ToolSpec("lol_compare", "Compara el rango de dos invocadores de League of Legends por Riot ID (Nombre#TAG).", CompareArgs, lol_compare, read_only=True),
-        ToolSpec("play_song", "Busca una canción y la reproduce o la agrega al final de la cola.", QueryArgs, play_song),
-        ToolSpec("play_next", "Busca una canción y la pone justo después de la actual (posición 1 de la cola).", QueryArgs, play_next),
-        ToolSpec("queue_songs", "Agrega varias canciones a la cola (máximo 15 por llamada).", QueueSongsArgs, queue_songs),
+        ToolSpec(
+            "play_song",
+            f"Busca una canción y la reproduce o la agrega al final de la cola. {NO_CONTROL_AFTER_PLAYBACK}",
+            QueryArgs,
+            play_song,
+        ),
+        ToolSpec(
+            "play_next",
+            f"Busca una canción y la pone justo después de la actual (posición 1 de la cola). {NO_CONTROL_AFTER_PLAYBACK}",
+            QueryArgs,
+            play_next,
+        ),
+        ToolSpec(
+            "queue_songs",
+            f"Agrega varias canciones a la cola (máximo 15 por llamada). {NO_CONTROL_AFTER_PLAYBACK}",
+            QueueSongsArgs,
+            queue_songs,
+        ),
         ToolSpec("skip", "Salta la canción actual.", NoArgs, skip),
         ToolSpec("pause", "Pausa la reproducción.", NoArgs, pause),
         ToolSpec("resume", "Reanuda la reproducción pausada.", NoArgs, resume),

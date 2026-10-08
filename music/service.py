@@ -16,6 +16,7 @@ ALONE_TIMEOUT = 180
 IDLE_TIMEOUT = 900
 LOOP_MODES = ["off", "song", "queue"]
 MAX_QUEUE_SONGS_PER_CALL = 15
+MAX_LOGGED_ERROR_CHARS = 300
 
 
 def _stop_playback(client) -> None:
@@ -121,7 +122,7 @@ class MusicService:
         }
         return EnqueueResult(track=track, preview=preview, busy=busy)
 
-    async def enqueue_next(self, query: str) -> EnqueueResult | None:
+    async def enqueue_next(self, query: str, start_playback: bool = True) -> EnqueueResult | None:
         entries = await self.extractor.search(query, 1)
         if not entries:
             return None
@@ -138,7 +139,8 @@ class MusicService:
             "duration": video.get("duration"),
             "uploader": video.get("uploader") or video.get("channel"),
         }
-        await self.ensure_playing()
+        if start_playback:
+            await self.ensure_playing()
         return EnqueueResult(track=track, preview=preview, busy=busy)
 
     async def resolve_song(self, query: str) -> tuple[str, str] | None:
@@ -147,7 +149,9 @@ class MusicService:
             return None
         return self._entry_url_and_title(entries[0])
 
-    async def queue_songs(self, songs: list, max_duration_s: int | None = None) -> QueueSongsResult:
+    async def queue_songs(
+        self, songs: list, max_duration_s: int | None = None, start_playback: bool = True
+    ) -> QueueSongsResult:
         result = QueueSongsResult()
         accepted = songs[:MAX_QUEUE_SONGS_PER_CALL]
         result.skipped_over_limit = len(songs) - len(accepted)
@@ -165,7 +169,7 @@ class MusicService:
                 continue
             result.queued.append(self.player.enqueue(url, title))
 
-        if result.queued:
+        if result.queued and start_playback:
             await self.ensure_playing()
         return result
 
@@ -215,6 +219,9 @@ class MusicService:
             await self._play_next_locked()
 
     def _on_song_end(self, error) -> None:
+        if error is not None:
+            detail = " ".join(str(error).split())[:MAX_LOGGED_ERROR_CHARS]
+            print(f"[musica] error de reproducción: {type(error).__name__}: {detail}")
         asyncio.run_coroutine_threadsafe(self.play_next(), self.loop)
 
     async def radio_next(self) -> bool:

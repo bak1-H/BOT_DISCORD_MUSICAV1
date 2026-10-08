@@ -570,3 +570,37 @@ async def test_leave_without_a_connected_client_does_nothing(tmp_path):
     rig = build_service(tmp_path)
 
     assert await rig.service.leave() is False
+
+
+async def test_song_end_with_an_error_logs_it_and_still_schedules_the_next_song(tmp_path, capsys):
+    rig = build_service(tmp_path, client=FakeVoiceClient())
+    queue_songs(rig.player, "a", "b")
+    await rig.service.ensure_playing()
+
+    await asyncio.get_running_loop().run_in_executor(None, rig.service._on_song_end, ValueError("ffmpeg murió"))
+    await settle(20)
+
+    assert "[musica] error de reproducción: ValueError: ffmpeg murió" in capsys.readouterr().out
+    assert rig.player.current["title"] == "Song b"
+
+
+async def test_song_end_error_log_is_one_capped_line(tmp_path, capsys):
+    rig = build_service(tmp_path, client=FakeVoiceClient())
+    error = RuntimeError("ffmpeg\nhttps://rr.googlevideo.com/signed " + "x" * 1000)
+
+    rig.service._on_song_end(error)
+    await settle(20)
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("[musica]")]
+    assert len(lines) == 1
+    assert lines[0].startswith("[musica] error de reproducción: RuntimeError: ffmpeg https://")
+    assert len(lines[0]) < 400
+
+
+async def test_song_end_without_error_prints_nothing(tmp_path, capsys):
+    rig = build_service(tmp_path, client=FakeVoiceClient())
+
+    rig.service._on_song_end(None)
+    await settle(20)
+
+    assert capsys.readouterr().out == ""

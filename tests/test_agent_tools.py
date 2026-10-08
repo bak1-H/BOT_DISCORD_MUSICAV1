@@ -4,7 +4,7 @@ import json
 import pytest
 
 from agent.context import MAX_DESTRUCTIVE_PER_TURN, MAX_SONGS_PER_TURN, MAX_TOOL_CALLS_PER_TURN
-from agent.tools import build_registry, execute_pending
+from agent.tools import background_playback, build_registry, execute_pending
 from tests.agent_support import (
     FakeLyrics,
     FakePlaylists,
@@ -24,6 +24,10 @@ ID_FIELDS = {"guild_id", "user_id", "channel_id", "author_id", "voice_channel_id
 
 async def run(rig, tool, **args):
     return await REGISTRY.execute(rig.ctx, tool, args)
+
+
+async def drain_background_playback():
+    await asyncio.gather(*background_playback)
 
 
 def prime_current(rig, title="Tusa"):
@@ -104,11 +108,95 @@ async def test_play_song_connects_enqueues_and_starts_playback(tmp_path):
     search_results(rig, tusa=("t1", "Tusa"))
 
     outcome = await run(rig, "play_song", query="tusa")
+    await drain_background_playback()
 
     assert outcome.ok
     assert "Tusa" in outcome.text
+    assert "Preparando" in outcome.text
     assert rig.voice.connect_calls != []
     assert rig.voice.client.play_calls == 1
+
+
+async def test_play_song_returns_while_the_playback_lock_is_held(tmp_path):
+    rig = build_rig(tmp_path)
+    search_results(rig, tusa=("t1", "Tusa"))
+    await rig.player.playback_lock.acquire()
+
+    outcome = await asyncio.wait_for(run(rig, "play_song", query="tusa"), timeout=1)
+
+    assert outcome.ok
+    assert rig.voice.client.play_calls == 0
+    rig.player.playback_lock.release()
+    await drain_background_playback()
+    assert rig.voice.client.play_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [("play_song", {"query": "tusa"}), ("play_next", {"query": "tusa"}), ("queue_songs", {"songs": ["tusa"]})],
+)
+async def test_failing_background_playback_does_not_break_the_tool_or_leak(tmp_path, capsys, tool, args):
+    rig = build_rig(tmp_path)
+    search_results(rig, tusa=("t1", "Tusa"))
+
+    async def broken_ensure_playing():
+        raise RuntimeError("boom")
+
+    rig.service.ensure_playing = broken_ensure_playing
+
+    outcome = await run(rig, tool, **args)
+    await asyncio.gather(*background_playback, return_exceptions=True)
+    await asyncio.sleep(0)
+
+    assert outcome.ok
+    assert background_playback == set()
+    assert "[agente] error al iniciar la reproducción: RuntimeError: boom" in capsys.readouterr().out
+    assert rig.notifier.texts == ["❌ No pude iniciar la reproducción."]
+
+
+async def test_failing_background_playback_logs_a_short_single_line_without_leaking_the_whole_message(tmp_path, capsys):
+    rig = build_rig(tmp_path)
+    search_results(rig, tusa=("t1", "Tusa"))
+
+    async def broken_ensure_playing():
+        raise RuntimeError("https://rr.googlevideo.com/signed\n" + "x" * 500)
+
+    rig.service.ensure_playing = broken_ensure_playing
+
+    await run(rig, "play_song", query="tusa")
+    await asyncio.gather(*background_playback, return_exceptions=True)
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("[agente]")]
+    assert len(lines) == 1
+    assert len(lines[0]) < 200
+    assert "RuntimeError" in lines[0]
+
+
+async def test_failing_background_playback_never_raises_when_the_notice_cannot_be_sent(tmp_path):
+    rig = build_rig(tmp_path)
+    search_results(rig, tusa=("t1", "Tusa"))
+
+    async def broken_ensure_playing():
+        raise RuntimeError("boom")
+
+    async def broken_send(*args, **kwargs):
+        raise RuntimeError("discord down")
+
+    rig.service.ensure_playing = broken_ensure_playing
+    rig.notifier.send = broken_send
+
+    outcome = await run(rig, "play_song", query="tusa")
+    results = await asyncio.gather(*background_playback, return_exceptions=True)
+
+    assert outcome.ok
+    assert all(not isinstance(result, BaseException) for result in results)
+
+
+@pytest.mark.parametrize("tool", ["play_song", "play_next", "queue_songs"])
+def test_playback_starting_tools_warn_the_model_not_to_control_playback_in_the_same_turn(tool):
+    description = next(schema["description"] for schema in REGISTRY.schemas() if schema["name"] == tool)
+
+    assert "no llames a skip, pause ni resume en el mismo turno" in description
 
 
 async def test_play_song_while_busy_reports_queue_position(tmp_path):
@@ -391,6 +479,7 @@ async def test_playlist_load_enqueues_all_songs_and_starts_playing(tmp_path):
     rig = build_rig(tmp_path, playlists=FakePlaylists({"mix": songs}))
 
     outcome = await run(rig, "playlist_load", name="mix")
+    await drain_background_playback()
 
     assert outcome.ok
     assert rig.voice.client.play_calls == 1
