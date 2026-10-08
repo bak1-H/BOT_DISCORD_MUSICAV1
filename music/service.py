@@ -318,6 +318,9 @@ class MusicService:
 
         except Exception as e:
             if isinstance(e, discord.ClientException) and "already playing" in str(e).lower():
+                player.queue.insert(0, track)
+                player.current = None
+                player.cleanup_audio_file()
                 return
 
             player.fail_count += 1

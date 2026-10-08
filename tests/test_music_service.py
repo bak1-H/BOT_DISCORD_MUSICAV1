@@ -252,6 +252,53 @@ async def test_a_player_error_is_reported_as_playback_not_download(tmp_path):
     assert rig.player.current["title"] == "Song b"
 
 
+async def test_an_already_playing_collision_requeues_the_track_without_a_notice(tmp_path):
+    client = FakeVoiceClient()
+    client.playing = True
+    rig = build_service(tmp_path, client=client)
+    queue_songs(rig.player, "a")
+
+    await rig.service.play_next()
+
+    assert [track.title for track in rig.player.queue] == ["Song a"]
+    assert rig.player.current is None
+    assert rig.player.audio_file is None
+    assert list(tmp_path.rglob("*.webm")) == []
+    assert rig.player.fail_count == 0
+    assert rig.notifier.messages == []
+
+    client.playing = False
+    await rig.service.ensure_playing()
+
+    assert client.play_calls == 1
+    assert rig.player.current["title"] == "Song a"
+    assert rig.player.queue == []
+
+
+async def test_an_already_playing_collision_in_loop_song_mode_does_not_double_queue(tmp_path):
+    client = FakeVoiceClient()
+    client.playing = True
+    rig = build_service(tmp_path, client=client)
+    rig.player.loop_mode = "song"
+    queue_songs(rig.player, "a")
+
+    await rig.service.play_next()
+    await rig.service.play_next()
+
+    assert [track.title for track in rig.player.queue] == ["Song a"]
+
+
+async def test_other_play_errors_still_count_a_failure_and_notify(tmp_path):
+    rig = build_service(tmp_path, client=FakeVoiceClient())
+    queue_songs(rig.player, "a")
+    rig.service.audio_source_factory = lambda path: (_ for _ in ()).throw(RuntimeError("ffmpeg exploded"))
+
+    await rig.service._play_next_locked()
+
+    assert rig.player.fail_count == 1
+    assert rig.notifier.texts.count("❌ No pude reproducir «Song a».") == 1
+
+
 async def test_a_youtube_login_block_sends_only_the_blocked_notice(tmp_path):
     rig = build_service(tmp_path, client=FakeVoiceClient())
     queue_songs(rig.player, "a", "b")
@@ -678,6 +725,7 @@ async def test_song_end_with_an_error_logs_it_and_still_schedules_the_next_song(
     rig = build_service(tmp_path, client=FakeVoiceClient())
     queue_songs(rig.player, "a", "b")
     await rig.service.ensure_playing()
+    rig.voice.client.playing = False
 
     await asyncio.get_running_loop().run_in_executor(None, rig.service._on_song_end, ValueError("ffmpeg murió"))
     await settle(20)

@@ -344,7 +344,7 @@ async def test_login_block_skips_song_without_counting_failure(isolated_bot, pat
     assert ctx.voice_client.disconnect_calls == 0
 
 
-async def test_already_playing_error_aborts_without_counting_or_retrying(isolated_bot, patch_extractor, ctx, monkeypatch):
+async def test_already_playing_error_requeues_the_track_without_counting_or_retrying(isolated_bot, patch_extractor, ctx, monkeypatch):
     queue_urls(isolated_bot, "a", "b")
 
     def refuse_to_play(source, after=None):
@@ -356,7 +356,10 @@ async def test_already_playing_error_aborts_without_counting_or_retrying(isolate
 
     assert isolated_bot.players.get(GID).fail_count == 0
     assert patch_extractor.download_calls == ["https://www.youtube.com/watch?v=a"]
-    assert queued_pairs(isolated_bot, GID) == [("https://www.youtube.com/watch?v=b", "Song b")]
+    assert queued_pairs(isolated_bot, GID) == [
+        ("https://www.youtube.com/watch?v=a", "Song a"),
+        ("https://www.youtube.com/watch?v=b", "Song b"),
+    ]
     assert not ctx.notifier.has_text_containing("No pude descargar")
 
 
