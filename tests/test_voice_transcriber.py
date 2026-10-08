@@ -1,5 +1,6 @@
 import asyncio
 import io
+import threading
 import wave
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from voice.transcriber import (
     Transcriber,
     TranscriptionError,
     create_gemini_transcriber,
+    stt_timeout_from_env,
     to_wav,
 )
 
@@ -105,3 +107,109 @@ def test_factory_falls_back_to_the_agent_model():
     env = {"GEMINI_API_KEY": API_KEY, "GEMINI_AGENT_MODEL": "agent-model"}
 
     assert create_gemini_transcriber(env)._model == "agent-model"
+
+
+def test_stt_timeout_env_parsing():
+    assert stt_timeout_from_env({}) == 20.0
+    assert stt_timeout_from_env({"VOICE_STT_TIMEOUT_S": " 30 "}) == 30.0
+    assert stt_timeout_from_env({"VOICE_STT_TIMEOUT_S": "7.5"}) == 7.5
+    for bad in ("abc", "", "0", "-3", "nan", "inf"):
+        assert stt_timeout_from_env({"VOICE_STT_TIMEOUT_S": bad}) == 20.0
+
+
+def test_factory_applies_the_configured_stt_timeout():
+    env = {"GEMINI_API_KEY": API_KEY, "VOICE_STT_TIMEOUT_S": "33"}
+
+    assert create_gemini_transcriber(env)._timeout_s == 33.0
+
+
+class CountingFactory:
+    def __init__(self, failures=0):
+        self.failures = failures
+        self.threads = []
+
+    def __call__(self):
+        self.threads.append(threading.get_ident())
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("no sdk")
+        return fake_client(FakeModels())
+
+
+async def test_warmup_builds_the_client_once_off_the_calling_thread():
+    factory = CountingFactory()
+    transcriber = GeminiTranscriber(None, "m", client_factory=factory)
+    worker = threading.Thread(target=transcriber.warmup)
+    worker.start()
+    worker.join()
+
+    assert await transcriber.transcribe(b"wav") == "hola mundo"
+    transcriber.warmup()
+
+    assert len(factory.threads) == 1
+    assert factory.threads[0] == worker.ident
+    assert factory.threads[0] != threading.get_ident()
+
+
+async def test_a_failing_warmup_does_not_raise_and_the_first_transcribe_retries():
+    factory = CountingFactory(failures=1)
+    transcriber = GeminiTranscriber(None, "m", client_factory=factory)
+
+    transcriber.warmup()
+    text = await transcriber.transcribe(b"wav")
+
+    assert text == "hola mundo"
+    assert len(factory.threads) == 2
+
+
+async def test_a_slow_warmup_never_blocks_the_event_loop():
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_factory():
+        started.set()
+        release.wait(timeout=5)
+        return fake_client(FakeModels())
+
+    transcriber = GeminiTranscriber(None, "m", client_factory=slow_factory)
+    warming = threading.Thread(target=transcriber.warmup)
+    warming.start()
+    assert started.wait(timeout=3)
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticking = asyncio.ensure_future(ticker())
+    pending = asyncio.ensure_future(transcriber.transcribe(b"wav"))
+    await asyncio.sleep(0.2)
+    ticks_while_blocked = ticks
+    assert not pending.done()
+    release.set()
+    text = await asyncio.wait_for(pending, 3)
+    ticking.cancel()
+    warming.join(timeout=3)
+
+    assert ticks_while_blocked >= 5
+    assert text == "hola mundo"
+
+
+async def test_a_failed_warmup_retries_off_the_event_loop_thread():
+    factory = CountingFactory(failures=1)
+    transcriber = GeminiTranscriber(None, "m", client_factory=factory)
+    transcriber.warmup()
+
+    await transcriber.transcribe(b"wav")
+
+    assert len(factory.threads) == 2
+    assert factory.threads[1] != threading.get_ident()
+
+
+def test_warmup_does_not_issue_any_request():
+    models = FakeModels()
+    GeminiTranscriber(fake_client(models), "m").warmup()
+
+    assert models.calls == []

@@ -284,6 +284,35 @@ def test_the_detector_is_warmed_up_once_on_the_worker_thread():
     assert detector.warmups[0] == rig.pipeline._thread.ident
 
 
+def test_the_transcriber_is_warmed_up_once_on_the_worker_thread():
+    transcriber = WarmableDetector()
+    pipeline = ListeningPipeline(FakeDetector(), lambda: None, transcriber=transcriber)
+    pipeline.start()
+    try:
+        assert transcriber.warmed.wait(timeout=3)
+    finally:
+        pipeline.stop()
+        pipeline._thread.join(timeout=3)
+
+    assert transcriber.warmups == [pipeline._thread.ident]
+    assert transcriber.warmups[0] != threading.get_ident()
+
+
+def test_a_failing_detector_warmup_does_not_skip_the_transcriber_warmup():
+    class Exploding(WarmableDetector):
+        def warmup(self):
+            raise RuntimeError("boom")
+
+    transcriber = WarmableDetector()
+    pipeline = ListeningPipeline(Exploding(), lambda: None, transcriber=transcriber)
+    pipeline.start()
+    try:
+        assert transcriber.warmed.wait(timeout=3)
+    finally:
+        pipeline.stop()
+        pipeline._thread.join(timeout=3)
+
+
 def test_a_failing_warmup_is_logged_and_does_not_kill_the_worker(capsys):
     class Exploding(WarmableDetector):
         def warmup(self):

@@ -1,4 +1,6 @@
 import asyncio
+import re
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -437,3 +439,63 @@ def test_debug_helper_accepts_truthy_values(value):
 @pytest.mark.parametrize("env", [{}, {"VOICE_DEBUG": "0"}, {"VOICE_DEBUG": "nope"}])
 def test_debug_helper_defaults_to_off(env):
     assert debug.enabled(env) is False
+
+
+def saved_wavs(directory):
+    return sorted(directory.glob("*.wav"))
+
+
+async def test_debug_dir_receives_the_exact_wav_sent_to_stt(monkeypatch, tmp_path):
+    target = tmp_path / "captures" / "nested"
+    monkeypatch.setenv("VOICE_DEBUG", "1")
+    monkeypatch.setenv("VOICE_DEBUG_DIR", str(target))
+    transcriber = FakeTranscriber("hola")
+    rig = Rig(transcriber)
+
+    await rig.say_command()
+
+    files = saved_wavs(target)
+    assert len(files) == 1
+    assert re.fullmatch(r"stt-\d{8}-\d{6}-\d{6}-7\.wav", files[0].name)
+    assert files[0].read_bytes() == transcriber.calls[0]
+
+
+def test_two_saves_in_the_same_second_do_not_overwrite_each_other(tmp_path):
+    env = {"VOICE_DEBUG": "1", "VOICE_DEBUG_DIR": str(tmp_path)}
+    first = datetime(2026, 1, 2, 3, 4, 5, 100, tzinfo=timezone.utc)
+    second = first.replace(microsecond=200)
+
+    debug.save_audio(b"one", 7, env=env, now=first)
+    debug.save_audio(b"two", 7, env=env, now=second)
+
+    assert sorted(path.read_bytes() for path in saved_wavs(tmp_path)) == [b"one", b"two"]
+
+
+@pytest.mark.parametrize("debug_value, directory_set", [("0", True), ("", True), ("1", False)])
+async def test_debug_dir_writes_nothing_unless_both_variables_are_set(monkeypatch, tmp_path, debug_value, directory_set):
+    monkeypatch.setenv("VOICE_DEBUG", debug_value)
+    if directory_set:
+        monkeypatch.setenv("VOICE_DEBUG_DIR", str(tmp_path / "captures"))
+    else:
+        monkeypatch.delenv("VOICE_DEBUG_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    rig = Rig(FakeTranscriber("hola"))
+
+    await rig.say_command()
+
+    assert list(tmp_path.rglob("*.wav")) == []
+    assert not (tmp_path / "captures").exists()
+
+
+async def test_an_unwritable_debug_dir_never_breaks_transcription(monkeypatch, tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"file")
+    monkeypatch.setenv("VOICE_DEBUG", "1")
+    monkeypatch.setenv("VOICE_DEBUG_DIR", str(blocker / "inside"))
+    transcriber = FakeTranscriber("oye makakiño skipea este tema")
+    rig = Rig(transcriber)
+
+    await rig.say_command()
+
+    assert len(transcriber.calls) == 1
+    assert rig.runner.calls[0][1] == "skipea este tema"

@@ -7,10 +7,9 @@ from agent.listener import RATE_LIMITED
 from agent.trigger import fold_char
 from voice import debug
 from voice.audio import BYTES_PER_SECOND
-from voice.transcriber import to_wav
+from voice.transcriber import stt_timeout_from_env, to_wav
 from voice.window import CommandWindow, VoiceMessage
 
-STT_TIMEOUT_S = 15.0
 STT_FAILED = "No pude entender el audio, intenta de nuevo."
 SEPARATORS = " ,.:;-!¡?¿"
 GAP = r"[\s,.:;!?¡¿-]*"
@@ -41,7 +40,7 @@ class VoiceCommandSession:
         transcriber,
         notifier,
         clock=time.monotonic,
-        stt_timeout_s=STT_TIMEOUT_S,
+        stt_timeout_s=None,
         loop=None,
         **window_options,
     ):
@@ -52,7 +51,7 @@ class VoiceCommandSession:
         self._listener = listener
         self._transcriber = transcriber
         self._notifier = notifier
-        self._stt_timeout_s = stt_timeout_s
+        self._stt_timeout_s = stt_timeout_from_env() if stt_timeout_s is None else stt_timeout_s
         self._clock = clock
         self._member = None
         self._tasks = set()
@@ -113,9 +112,11 @@ class VoiceCommandSession:
             return
         self._warned.discard(member.id)
         debug.emit(f"stt audio={len(pcm) / BYTES_PER_SECOND:.2f}s")
+        wav_bytes = to_wav(pcm)
+        debug.save_audio(wav_bytes, member.id)
         started = self._clock()
         try:
-            transcript = await asyncio.wait_for(self._transcriber.transcribe(to_wav(pcm)), self._stt_timeout_s)
+            transcript = await asyncio.wait_for(self._transcriber.transcribe(wav_bytes), self._stt_timeout_s)
         except Exception as error:
             print(f"[voz] stt error: {type(error).__name__}")
             debug.emit(f"stt error {type(error).__name__}: {error}")

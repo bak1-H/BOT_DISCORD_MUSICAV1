@@ -133,6 +133,7 @@ class VoiceActivation:
             lambda: self._session_for(guild),
             rms_threshold=self._rms_threshold,
             clock=self._clock,
+            transcriber=self._transcriber,
         )
 
     def _session_for(self, guild):

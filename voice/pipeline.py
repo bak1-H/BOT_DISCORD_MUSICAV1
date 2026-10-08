@@ -20,10 +20,11 @@ class UserTrack:
 
 
 class ListeningPipeline:
-    def __init__(self, detector, session_provider, rms_threshold=DEFAULT_RMS_THRESHOLD, clock=time.monotonic, queue_size=QUEUE_SIZE):
+    def __init__(self, detector, session_provider, rms_threshold=DEFAULT_RMS_THRESHOLD, clock=time.monotonic, queue_size=QUEUE_SIZE, transcriber=None):
         self.inbox = queue.Queue(queue_size)
         self.dropped = 0
         self._detector = detector
+        self._transcriber = transcriber
         self._session_provider = session_provider
         self._rms_threshold = rms_threshold
         self._clock = clock
@@ -59,13 +60,14 @@ class ListeningPipeline:
         return self._stopped.is_set()
 
     def _run(self):
-        self._guarded(self._warmup)
+        self._guarded(self._warmup, self._detector)
+        self._guarded(self._warmup, self._transcriber)
         while not self._stopped.is_set():
             self.step()
         self._tracks.clear()
 
-    def _warmup(self):
-        warmup = getattr(self._detector, "warmup", None)
+    def _warmup(self, target):
+        warmup = getattr(target, "warmup", None)
         if warmup is not None:
             warmup()
 
