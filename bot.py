@@ -65,9 +65,12 @@ class MusicBot(commands.Bot):
         super().__init__(**options)
         self.playback_loop = None
         self.agent_listener = None
+        self.voice_cls = None
 
     async def setup_hook(self):
         self.playback_loop = asyncio.get_running_loop()
+        if self.voice_cls is None:
+            self.voice_cls = install_voice()
         if self.agent_listener is None:
             self.agent_listener = install_agent()
 
@@ -114,7 +117,7 @@ def get_music_service(guild_id: int) -> MusicService:
         player = players.get(guild_id)
         service = MusicService(
             player=player,
-            voice=DiscordVoiceGateway(bot, guild_id),
+            voice=DiscordVoiceGateway(bot, guild_id, voice_cls=bot.voice_cls),
             notifier=ChannelNotifier(player),
             extractor=extractor,
             audio_source_factory=ffmpeg_audio_source,
@@ -628,6 +631,25 @@ AGENT_DISABLED_VALUES = {"false", "0", "no", "off"}
 
 def agent_enabled(env=os.environ) -> bool:
     return env.get("AGENT_ENABLED", "true").strip().lower() not in AGENT_DISABLED_VALUES
+
+
+VOICE_ENABLED_VALUES = {"true", "1", "yes", "on"}
+
+
+def voice_activation_enabled(env=os.environ) -> bool:
+    return env.get("VOICE_ACTIVATION_ENABLED", "false").strip().lower() in VOICE_ENABLED_VALUES
+
+
+def install_voice(env=os.environ):
+    if not voice_activation_enabled(env):
+        return None
+    try:
+        from discord.ext.voice_recv import VoiceRecvClient
+    except Exception as error:
+        print(f"[voz] deshabilitado: {type(error).__name__}")
+        return None
+    print("[voz] cliente de voz con recepcion instalado")
+    return VoiceRecvClient
 
 
 def install_agent(env=os.environ):
