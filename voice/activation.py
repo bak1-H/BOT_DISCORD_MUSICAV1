@@ -46,6 +46,8 @@ class VoiceActivation:
         self._window_options = dict(window_options or {})
         self._clock = clock
         self._notice_poll_s = notice_poll_s
+        self._enabled = True
+        self._clients = {}
         self._pipelines = {}
         self._sessions = {}
         self._noticed = set()
@@ -54,8 +56,35 @@ class VoiceActivation:
         self._notice_tasks = set()
         self._logged = set()
 
+    @property
+    def enabled(self):
+        return self._enabled
+
+    def listening_in(self, guild_id):
+        pipeline = self._pipelines.get(guild_id)
+        return pipeline is not None and not pipeline.stopped
+
+    def enable(self, clients=()):
+        self._enabled = True
+        for client in clients:
+            self.ensure_listening(client)
+
+    def disable(self):
+        self._enabled = False
+        for guild_id in list(self._pipelines):
+            client = self._clients.get(guild_id)
+            self.forget(guild_id)
+            if client is not None:
+                self._stop_client(client)
+
+    def _stop_client(self, client):
+        try:
+            client.stop_listening()
+        except Exception as error:
+            self._log_once(f"stop {type(error).__name__}")
+
     def ensure_listening(self, client):
-        if not hasattr(client, "listen"):
+        if not self._enabled or not hasattr(client, "listen"):
             return False
         try:
             if not client.is_connected() or client.is_listening():
@@ -73,6 +102,7 @@ class VoiceActivation:
             return False
         self.forget(guild.id)
         self._pipelines[guild.id] = pipeline
+        self._clients[guild.id] = client
         pipeline.start()
         self._schedule_notice(client)
         return True
@@ -92,6 +122,7 @@ class VoiceActivation:
 
     def forget(self, guild_id):
         pipeline = self._pipelines.pop(guild_id, None)
+        self._clients.pop(guild_id, None)
         self._sessions.pop(guild_id, None)
         if pipeline is not None:
             pipeline.stop()
@@ -109,7 +140,7 @@ class VoiceActivation:
         channel = player.text_channel
         if channel is None:
             return None
-        gated = NoticeGatedTranscriber(self._transcriber, lambda: self._deliver_notice(guild.id))
+        gated = NoticeGatedTranscriber(self._transcriber, lambda: self._permit_transcription(guild.id))
         cached = self._sessions.get(guild.id)
         if cached is not None and (cached[0] is channel or cached[1].window.busy):
             return cached[1]
@@ -150,6 +181,9 @@ class VoiceActivation:
                 return
             await asyncio.sleep(self._notice_poll_s)
         self._noticed.discard(key)
+
+    async def _permit_transcription(self, guild_id):
+        return self._enabled and await self._deliver_notice(guild_id)
 
     async def _deliver_notice(self, guild_id):
         async with self._notice_locks.setdefault(guild_id, asyncio.Lock()):

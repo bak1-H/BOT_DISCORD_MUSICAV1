@@ -154,3 +154,13 @@ async def test_voice_hint_has_no_voseo(tmp_path):
 
     for form in VOSEO_FORMS:
         assert form not in prompt
+
+
+async def test_voice_hint_maps_leaving_to_the_tool_instead_of_a_confirmation(tmp_path):
+    rig = build_rig(tmp_path)
+    rig.ctx.by_voice = True
+
+    prompt = build_turn_prompt(rig.ctx, "sal del canal")
+
+    assert '"sal del canal"' in prompt
+    assert "parar todo, salir del canal" not in prompt

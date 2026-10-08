@@ -68,6 +68,9 @@ class MusicBot(commands.Bot):
         self.voice_cls = None
         self.voice_activation = None
 
+    def keeps_voice_alive(self):
+        return self.voice_activation is not None and self.voice_activation.enabled
+
     def on_voice_connected(self, client):
         if self.voice_activation is not None:
             self.voice_activation.ensure_listening(client)
@@ -134,6 +137,8 @@ def get_music_service(guild_id: int) -> MusicService:
             extractor=extractor,
             audio_source_factory=ffmpeg_audio_source,
             loop=bot.playback_loop,
+            keep_alive=bot.keeps_voice_alive,
+            idle_timeout_s=voice_idle_seconds(),
         )
         music_services[guild_id] = service
     return service
@@ -208,6 +213,48 @@ async def skip(ctx):
 async def stop(ctx):
     await get_music_service(ctx.guild.id).stop()
     await ctx.send("⏹️ Reproducción detenida.")
+
+
+@bot.command(name="salir", aliases=["leave"])
+async def salir(ctx):
+    if await get_music_service(ctx.guild.id).leave():
+        await ctx.send("👋 Me fui del canal de voz.")
+    else:
+        await ctx.send("❌ No estoy en un canal de voz.")
+
+
+VOICE_SWITCH_USAGE = "❌ Uso: `!voz on`, `!voz off` o `!voz estado`."
+VOICE_SWITCH_OWNER_ONLY = "❌ Solo el dueño del bot puede usar este comando."
+VOICE_SWITCH_OWNER_UNVERIFIED = "❌ No pude verificar al dueño del bot en este momento. Inténtalo de nuevo más tarde."
+VOICE_SWITCH_UNAVAILABLE ="❌ La activación por voz no está habilitada en este servidor."
+
+
+def describe_voice_state(activation, guild_id: int) -> str:
+    state = "activada" if activation.enabled else "desactivada"
+    listening = "escuchando" if activation.listening_in(guild_id) else "sin escuchar"
+    return f"🎙️ Activación por voz: **{state}**. En este servidor: **{listening}**."
+
+
+@bot.command(name="voz")
+async def voz(ctx, action: str = None):
+    try:
+        is_owner = await bot.is_owner(ctx.author)
+    except Exception as error:
+        print(f"Owner check failed: {error}")
+        return await ctx.send(VOICE_SWITCH_OWNER_UNVERIFIED)
+    if not is_owner:
+        return await ctx.send(VOICE_SWITCH_OWNER_ONLY)
+    activation = bot.voice_activation
+    if activation is None:
+        return await ctx.send(VOICE_SWITCH_UNAVAILABLE)
+    action = (action or "").lower()
+    if action == "on":
+        activation.enable(bot.voice_clients)
+    elif action == "off":
+        activation.disable()
+    elif action != "estado":
+        return await ctx.send(VOICE_SWITCH_USAGE)
+    await ctx.send(describe_voice_state(activation, ctx.guild.id))
 
 
 @bot.command()
@@ -385,6 +432,7 @@ async def comandos(ctx):
     embed.add_field(name="!play <canción o URL>", value="Reproduce o añade a la cola.", inline=False)
     embed.add_field(name="!skip", value="Salta la canción actual.", inline=False)
     embed.add_field(name="!stop", value="Detiene y desconecta el bot.", inline=False)
+    embed.add_field(name="!salir / !leave", value="El bot sale del canal de voz.", inline=False)
     embed.add_field(name="!pause / !resume", value="Pausa o reanuda la reproducción.", inline=False)
     embed.add_field(name="!queue / !q", value="Muestra la cola de reproducción.", inline=False)
     embed.add_field(name="!np / !nowplaying", value="Muestra la canción actual.", inline=False)
@@ -643,6 +691,19 @@ AGENT_DISABLED_VALUES = {"false", "0", "no", "off"}
 
 def agent_enabled(env=os.environ) -> bool:
     return env.get("AGENT_ENABLED", "true").strip().lower() not in AGENT_DISABLED_VALUES
+
+
+DEFAULT_VOICE_IDLE_MINUTES = 15
+
+
+def voice_idle_seconds(env=os.environ) -> float:
+    try:
+        minutes = float(env.get("VOICE_IDLE_MINUTES", ""))
+    except ValueError:
+        minutes = DEFAULT_VOICE_IDLE_MINUTES
+    if minutes <= 0:
+        minutes = DEFAULT_VOICE_IDLE_MINUTES
+    return minutes * 60
 
 
 VOICE_ENABLED_VALUES = {"true", "1", "yes", "on"}

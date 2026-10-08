@@ -334,6 +334,30 @@ async def test_stop_proposes_then_confirmation_stops_and_disconnects(tmp_path):
     assert rig.player.queue == []
 
 
+async def test_leave_disconnects_without_asking_for_confirmation(tmp_path):
+    rig = build_rig(tmp_path)
+    client = rig.voice.client
+    fill_queue(rig.player, "a")
+
+    outcome = await run(rig, "leave")
+
+    assert outcome.ok
+    assert outcome.pending is None
+    assert not REGISTRY.is_destructive("leave")
+    assert client.disconnect_calls == 1
+    assert rig.player.queue == []
+
+
+async def test_leave_outside_a_voice_channel_reports_a_failure(tmp_path):
+    rig = build_rig(tmp_path)
+    rig.voice.client.connected = False
+
+    outcome = await run(rig, "leave")
+
+    assert not outcome.ok
+    assert outcome.pending is None
+
+
 async def test_playlist_lifecycle_create_add_show_list(tmp_path):
     playlists = FakePlaylists()
     rig = build_rig(tmp_path, playlists=playlists)
@@ -467,6 +491,7 @@ def test_registry_exposes_exactly_the_specified_tools():
         "clear_queue",
         "playlist_remove",
         "playlist_delete",
+        "leave",
         "stop",
     }
     for forbidden in ("purge", "clear", "reiniciar", "restart", "shell", "read_file"):

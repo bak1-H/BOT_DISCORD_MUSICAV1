@@ -244,6 +244,27 @@ class FakeExtractor:
         return info, path, "web"
 
 
+class FakeSleeper:
+    def __init__(self):
+        self.now = 0
+        self.waiters = []
+
+    async def sleep(self, seconds):
+        future = asyncio.get_running_loop().create_future()
+        self.waiters.append((self.now + seconds, future))
+        await future
+
+    async def advance(self, seconds):
+        self.now += seconds
+        for waiter in list(self.waiters):
+            deadline, future = waiter
+            if deadline <= self.now:
+                self.waiters.remove(waiter)
+                if not future.done():
+                    future.set_result(None)
+        await settle(10)
+
+
 async def settle(cycles=5):
     for _ in range(cycles):
         await asyncio.sleep(0)

@@ -511,6 +511,12 @@ async def stop(ctx, args):
     return propose("stop", "¿Seguro que quieres detener la reproducción y vaciar la cola?")
 
 
+async def leave(ctx, args):
+    if await ctx.music.leave():
+        return ToolOutcome("Salí del canal de voz.")
+    return failure("No estoy en un canal de voz.")
+
+
 async def remove_from_queue(ctx, args):
     queue = ctx.music.player.queue
     if args.position > len(queue):
@@ -737,6 +743,7 @@ def build_registry() -> ToolRegistry:
             destructive=True,
         ),
         ToolSpec("playlist_delete", "Propone borrar una playlist. Requiere confirmación del usuario.", NameArgs, playlist_delete, destructive=True),
+        ToolSpec("leave", "Sale del canal de voz sin pedir confirmación: detiene la música, vacía la cola y desconecta el bot. Úsala cuando pidan que salgas, te vayas o dejes el canal.", NoArgs, leave),
         ToolSpec("stop", "Propone detener todo y desconectar el bot. Requiere confirmación del usuario.", NoArgs, stop, destructive=True),
     ]
     return ToolRegistry(specs)

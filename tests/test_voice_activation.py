@@ -23,6 +23,11 @@ class FakeListenClient:
         self.sinks = []
         self.listen_calls = 0
         self.report_not_listening = False
+        self.stop_listening_calls = 0
+
+    def stop_listening(self):
+        self.stop_listening_calls += 1
+        self.listening = False
 
     def is_connected(self):
         return self.connected
@@ -302,3 +307,60 @@ async def test_without_a_text_channel_there_is_no_session():
     rig = Rig(text_channel=None)
 
     assert rig.activation._session_for(SimpleNamespace(id=GUILD_ID)) is None
+
+
+async def test_disable_stops_listening_everywhere_and_drops_the_open_session(rig):
+    rig.activation.ensure_listening(rig.client)
+    pipeline = rig.activation._pipelines[GUILD_ID]
+    rig.activation._session_for(SimpleNamespace(id=GUILD_ID))
+
+    rig.activation.disable()
+
+    assert rig.activation.enabled is False
+    assert pipeline.stopped
+    assert rig.client.stop_listening_calls == 1
+    assert rig.activation.listening_in(GUILD_ID) is False
+    assert rig.activation._sessions == {}
+
+
+async def test_new_triggers_are_prevented_while_disabled(rig):
+    rig.activation.disable()
+
+    assert rig.activation.ensure_listening(rig.client) is False
+    assert rig.client.listen_calls == 0
+
+    guild = make_guild(rig.client)
+    rig.activation.voice_state_changed(member(7, guild), state(70), state(70))
+    assert rig.client.listen_calls == 0
+
+
+async def test_a_command_already_captured_never_reaches_the_transcriber_after_disable(rig):
+    rig.activation._listener = session_listener()
+    transcriber = rig.activation._transcriber
+    session = rig.activation._session_for(SimpleNamespace(id=GUILD_ID))
+
+    rig.activation.disable()
+    await session._transcribe_and_handle(SimpleNamespace(id=7, display_name="Maxi"), b"\x00\x01")
+
+    assert transcriber.calls == []
+
+
+async def test_enable_rearms_listening_on_the_connected_clients(rig):
+    rig.activation.disable()
+
+    rig.activation.enable([rig.client])
+
+    assert rig.activation.enabled is True
+    assert rig.client.listen_calls == 1
+    assert rig.activation.listening_in(GUILD_ID) is True
+
+
+async def test_enable_does_not_repeat_the_privacy_notice(rig):
+    rig.activation.ensure_listening(rig.client)
+    await rig.settle()
+    rig.activation.disable()
+
+    rig.activation.enable([rig.client])
+    await rig.settle()
+
+    assert rig.notices == [PRIVACY_NOTICE]

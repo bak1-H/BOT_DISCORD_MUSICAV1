@@ -2,7 +2,7 @@ HELP_TITLE = "🎵 Ayuda de Makakiño"
 
 REPO_URL = "https://github.com/bak1-H/BOT_DISCORD_MUSICA"
 
-FALLBACK_COMMANDS = ("!play", "!skip", "!stop", "!reiniciar", "!ayuda")
+FALLBACK_COMMANDS = ("!play", "!skip", "!stop", "!salir", "!reiniciar", "!ayuda")
 
 HELP_SECTIONS = (
     (
@@ -28,8 +28,14 @@ HELP_SECTIONS = (
         "Confirmar y Cancelar. Solo quien hizo el pedido puede confirmar y expira en 60 segundos.",
     ),
     (
+        "Por voz",
+        "Si la escucha por voz está activa, di \"maca quino\" (o \"oye maca quino\") y tu pedido en el canal de voz. "
+        "El bot se queda en el canal esperando la frase y se va tras un rato sin música. "
+        "Para que salga ya, usa !salir o pídeselo: \"oye maca quino, sal del canal\".",
+    ),
+    (
         "Si la IA no responde",
-        "Estos comandos funcionan siempre, sin IA: !play <canción>, !skip, !stop, !reiniciar y !ayuda.",
+        "Estos comandos funcionan siempre, sin IA: !play <canción>, !skip, !stop, !salir, !reiniciar y !ayuda.",
     ),
     (
         "Repositorio",
