@@ -150,33 +150,33 @@ def fake_youtube_dl(monkeypatch):
     return FakeYoutubeDL
 
 
-async def test_download_uses_default_selection_first_and_injected_directory(fake_youtube_dl, tmp_path):
+async def test_download_uses_po_token_client_first_and_injected_directory(fake_youtube_dl, tmp_path):
     info, path, client = await ytdl.download_audio_with_fallback(ytdl.YtdlpSettings(), str(tmp_path), 5, "https://u")
 
-    assert client == "default"
-    assert [i.client for i in fake_youtube_dl.instances] == [None]
+    assert client == "mweb"
+    assert [i.client for i in fake_youtube_dl.instances] == ["mweb"]
     assert info["id"] == "vid"
     assert path == os.path.join(str(tmp_path), "5_vid.webm")
     assert os.path.exists(path)
 
 
 async def test_download_falls_back_to_next_client(fake_youtube_dl, tmp_path):
-    fake_youtube_dl.failing_clients = {None, "web", "android_vr"}
+    fake_youtube_dl.failing_clients = {"mweb", None, "web", "android_vr"}
 
     _, path, client = await ytdl.download_audio_with_fallback(ytdl.YtdlpSettings(), str(tmp_path), 5, "https://u")
 
     assert client == "android"
-    assert [i.client for i in fake_youtube_dl.instances] == [None, "web", "android_vr", "android"]
+    assert [i.client for i in fake_youtube_dl.instances] == ["mweb", None, "web", "android_vr", "android"]
     assert path.startswith(str(tmp_path))
 
 
-async def test_download_tries_every_forced_client_in_order_after_default(fake_youtube_dl, tmp_path):
-    fake_youtube_dl.failing_clients = {None}
+async def test_download_falls_back_to_default_selection_when_po_token_client_fails(fake_youtube_dl, tmp_path):
+    fake_youtube_dl.failing_clients = {"mweb"}
 
     _, _, client = await ytdl.download_audio_with_fallback(ytdl.YtdlpSettings(), str(tmp_path), 5, "https://u")
 
-    assert client == "web"
-    assert ytdl.DOWNLOAD_ATTEMPTS == [None, "web", "android_vr", "android", "ios"]
+    assert client == "default"
+    assert ytdl.DOWNLOAD_ATTEMPTS == ["mweb", None, "web", "android_vr", "android", "ios"]
 
 
 def test_default_download_options_omit_player_client_but_keep_the_rest():
@@ -222,7 +222,7 @@ async def test_cancelling_the_download_stops_trying_further_clients(fake_youtube
         await task
     await asyncio.sleep(0.05)
 
-    assert [i.client for i in fake_youtube_dl.instances] == [None]
+    assert [i.client for i in fake_youtube_dl.instances] == ["mweb"]
 
 
 @pytest.mark.parametrize(

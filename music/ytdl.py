@@ -8,9 +8,10 @@ from dataclasses import dataclass
 import yt_dlp
 
 YT_CLIENTS = ["web", "android_vr", "android", "ios"]
+PO_TOKEN_CLIENT = "mweb"
 DEFAULT_CLIENT = None
 DEFAULT_CLIENT_LABEL = "default"
-DOWNLOAD_ATTEMPTS = [DEFAULT_CLIENT, *YT_CLIENTS]
+DOWNLOAD_ATTEMPTS = [PO_TOKEN_CLIENT, DEFAULT_CLIENT, *YT_CLIENTS]
 DOWNLOAD_SOCKET_TIMEOUT_S = 30
 VIDEO_ID_PATTERN = re.compile(r"(?:[?&]v=|youtu\.be/)([A-Za-z0-9_-]+)")
 
