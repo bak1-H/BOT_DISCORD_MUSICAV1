@@ -3,6 +3,7 @@ PyNaCl
 python-dotenv
 lyricsgenius
 yt-dlp[default]
+bgutil-ytdlp-pot-provider==2.0.2
 davey==0.1.6
 audioop-lts; python_version >= "3.13"
 vosk==0.3.45
