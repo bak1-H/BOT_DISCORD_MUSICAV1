@@ -198,6 +198,34 @@ async def test_download_raises_last_error_when_every_client_fails(fake_youtube_d
         await ytdl.download_audio_with_fallback(ytdl.YtdlpSettings(), str(tmp_path), 5, "https://u")
 
 
+async def test_download_retries_every_client_without_cookies_when_all_fail_with_them(
+    fake_youtube_dl, tmp_path, monkeypatch
+):
+    def fail_with_cookies(self, url, download):
+        if self.opts["cookiefile"]:
+            raise RuntimeError("403 with cookies")
+        return {"id": "vid", "title": "Title", "entries": None}
+
+    monkeypatch.setattr(FakeYoutubeDL, "extract_info", fail_with_cookies)
+    settings = ytdl.YtdlpSettings(cookies_file="c.txt")
+
+    _, path, client = await ytdl.download_audio_with_fallback(settings, str(tmp_path), 5, "https://u")
+
+    cookie_files = [i.opts["cookiefile"] for i in fake_youtube_dl.instances]
+    assert cookie_files == ["c.txt"] * len(ytdl.DOWNLOAD_ATTEMPTS) + [None]
+    assert client == "mweb"
+    assert os.path.exists(path)
+
+
+async def test_download_without_cookies_does_not_repeat_clients(fake_youtube_dl, tmp_path):
+    fake_youtube_dl.failing_clients = set(ytdl.DOWNLOAD_ATTEMPTS)
+
+    with pytest.raises(RuntimeError):
+        await ytdl.download_audio_with_fallback(ytdl.YtdlpSettings(), str(tmp_path), 5, "https://u")
+
+    assert len(fake_youtube_dl.instances) == len(ytdl.DOWNLOAD_ATTEMPTS)
+
+
 def test_download_options_set_a_socket_timeout():
     opts = ytdl.build_download_opts(ytdl.YtdlpSettings(), "dl", 5, "web")
 
