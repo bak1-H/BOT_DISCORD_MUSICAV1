@@ -3,7 +3,7 @@ import copy
 import glob
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import yt_dlp
 
@@ -107,8 +107,11 @@ async def download_audio_with_fallback(
 ) -> tuple[dict, str, str]:
     loop = asyncio.get_running_loop()
     last_error = None
-    for client in DOWNLOAD_ATTEMPTS:
-        opts = build_download_opts(settings, download_dir, gid, client)
+    settings_attempts = [settings]
+    if settings.cookies_file:
+        settings_attempts.append(replace(settings, cookies_file=None))
+    for attempt_settings, client in ((s, c) for s in settings_attempts for c in DOWNLOAD_ATTEMPTS):
+        opts = build_download_opts(attempt_settings, download_dir, gid, client)
 
         def _download():
             with yt_dlp.YoutubeDL(opts) as ydl:
